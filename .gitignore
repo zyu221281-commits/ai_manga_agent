@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+tmp_pytest/
+
+# Docker
+docker-compose.override.yml
+
+# 数据
+data/
+*.db
+*.sqlite3
+
+# 生成产物（视频/音频/图片/检查点/追踪）
+output/
+
+# 日志
+logs/
+*.log
+
+# 模型缓存
+models/
+*.onnx
+*.pt
+*.bin
+
+# 密钥
+.env
+*.key
+secrets/
