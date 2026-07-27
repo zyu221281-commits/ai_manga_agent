@@ -1,6 +1,6 @@
-﻿"""Writer Agent：剧本 + 分镜 + 提示词三件套
+"""Writer Agent：剧本 + 分镜 + 提示词三件套
 
- 文档 6.3：
+V4 文档 6.3：
 - 输入: EpisodePlan + 角色锚点 + 前情摘要 + 伏笔上下文
 - 输出: {script, storyboard, image_prompts, foreshadowing} 四件套
 - 三件套一次性产出，避免多次 LLM 调用浪费 token
@@ -89,8 +89,13 @@ WRITER_PROMPT = """你是漫剧编剧+分镜师，请根据以下单集大纲，
       "scene_id": 1,
       "duration_s": 5,
       "shot_type": "close-up|medium|wide|extreme-close-up",
+      "camera_angle": "front|side|back|side-angle|over-shoulder",
       "camera_motion": "static|zoom-in|zoom-out|pan-left|pan-right|dolly-in|dolly-out",
       "description": "画面描述（≤50字，给图像生成用，描述视觉构图）",
+      "characters": ["本镜头出现的角色名列表"],
+      "pose": "本镜头角色姿态描述（如：crouching, holding pistol in both hands）",
+      "expression": "本镜头角色表情（如：tense, focused stare）",
+      "position": "角色在画面中的位置（如：center-right, medium shot）",
       "narration": "该镜头的语音旁白（给音频生成用，必须是听觉叙事不是画面描述。有 dialogue 的镜头可留空）",
       "audio_scene": "声音场景描述（供 Seed Audio 生成背景音/BGM/环境音效。示例：'冷风呼啸，断弦颤音，低沉悬疑的背景音乐'）",
       "transition": "cut|fade|dissolve|wipe"
@@ -99,8 +104,9 @@ WRITER_PROMPT = """你是漫剧编剧+分镜师，请根据以下单集大纲，
   "image_prompts": [
     {{
       "shot_id": 1,
-      "prompt": "[角色名 with id_card特征], [动作描述], 场景:[environment, lighting, color_tone], [风格:anime_comic], [quality_tags]",
-      "negative_prompt": "[id_card.negative_traits], 低质量画面描述",
+      "prompt": "[场景上下文简述，仅作为辅助。最终 prompt 由 VisualDescriptor + PromptTemplateEngine 确定性渲染]",
+      "negative_prompt": "通用负面词（如 lowres, bad anatomy, watermark, deformed）",
+      "ref_character": "主角名（如有）",
       "scene_type": "KEY_SCENE|NORMAL_SCENE"
     }}
   ],
@@ -110,7 +116,14 @@ WRITER_PROMPT = """你是漫剧编剧+分镜师，请根据以下单集大纲，
   }}
 }}
 
-# Flux 提示词格式
+重要约束：
+1. storyboard[].camera_angle 为必填字段，从 [front, side, back, side-angle, over-shoulder] 中选一个。
+2. storyboard[].characters 列出本镜头出场的角色名（必须与 script.characters 中的 name 一致）。
+3. storyboard[].pose / expression / position 描述本镜头角色的瞬时状态（这是每集唯一允许变化的自由度）。
+4. image_prompts[].prompt 只需提供场景上下文简述，不要重复 id_card 中已有的角色外貌特征
+   （角色 appearance 由 VisualDescriptor 从 character_anchors.id_card 原文复制）。
+
+# Flux 提示词格式（参考，由 PromptTemplateEngine 确定性渲染）
 [character with hair_color, eye_color, outfit], [action], [scene], [style:anime_comic], [quality_tags]
 quality_tags 选用：high quality, detailed, vibrant colors, cinematic lighting, sharp focus
 """
@@ -145,7 +158,7 @@ class WriterAgent(BaseAgent):
         try:
             result = await self._llm_json(
                 messages=messages,
-                model="deepseek--pro",
+                model="deepseek-v4-pro",
                 temperature=0.7,
                 max_tokens=16384,
             )
@@ -171,12 +184,30 @@ class WriterAgent(BaseAgent):
         if "storyboard" in result:
             result["storyboard"] = self._trim_narration_to_duration(result["storyboard"])
 
+        # Build visual_specs for deterministic prompt rendering
+        # 在 Writer 输出后立即构建结构化视觉描述，供 Composer 用 PromptTemplateEngine 渲染
+        try:
+            from app.quality.visual_descriptor import visual_descriptor
+            # 构造一个最小的 asset_library 视图供 VisualDescriptor 使用
+            asset_library_view = {
+                "characters": list(character_anchors.values()) if isinstance(character_anchors, dict) else (character_anchors or []),
+                "style_template": style_template or {},
+            }
+            result["visual_specs"] = visual_descriptor.build_all(
+                storyboard=result.get("storyboard", []),
+                script=result.get("script", {}),
+                asset_library=asset_library_view,
+            )
+        except Exception as e:
+            self.logger.warning("visual_specs build failed (degraded): %s", e)
+            result["visual_specs"] = []
+
         if self.lineage_tracker:
             await self.lineage_tracker.record(
                 episode_id=self.episode_id or "",
                 artifact_type="script",
                 artifact_data={"scenes_count": len(result["script"].get("scenes", []))},
-                model_name="deepseek--pro",
+                model_name="deepseek-v4-pro",
                 model_params={"temperature": 0.7, "max_tokens": 16384},
                 trace_id=self.trace_id,
             )

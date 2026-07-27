@@ -1,10 +1,11 @@
-﻿""""Celery + Beat 配置（含 DLQ）
+""""Celery + Beat 配置（含 DLQ）
 
- 任务调度：
+V4 任务调度：
 - Celery 任务粒度调度（不参与单集内部流程）
-- 60 集 → 60 个 Celery task → 各自启动 LangGraph 工作流
+- N 集 → N 个 Celery task → 各自启动 LangGraph 工作流
 - 并行度 = 3，episode_id 作为幂等键
 - 重试 2 次失败 → DLQ
+- N 默认从 settings.DEFAULT_TOTAL_EPISODES 读取（默认 30）
 """
 
 from __future__ import annotations

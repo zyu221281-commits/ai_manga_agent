@@ -1,4 +1,4 @@
-﻿"""Character consistency service — real CLIP similarity check.
+"""Character consistency service — real CLIP similarity check.
 
 Uses open_clip ViT-B/32 to compute cosine similarity between a generated
 image and the character's seed anchor image. On low similarity, triggers
@@ -82,6 +82,13 @@ class CharacterAnchorModel(_Base):
     seed = Column(Integer, default=42)
     traits_json = Column(Text, default="[]")
     generation_count = Column(Integer, default=0)
+    # Multi-view anchor fields (front / side / back), each with local path + remote URL
+    front_image_path = Column(Text, default="")
+    side_image_path = Column(Text, default="")
+    back_image_path = Column(Text, default="")
+    front_image_url = Column(Text, default="")
+    side_image_url = Column(Text, default="")
+    back_image_url = Column(Text, default="")
 
 
 @dataclass
@@ -94,6 +101,11 @@ class CharacterAnchor:
     seed: int = 42
     traits: list[str] = field(default_factory=list)
     generation_count: int = 0
+    # Multi-view anchor
+    # view_images: {"front": local_path, "side": local_path, "back": local_path}
+    view_images: dict[str, str] = field(default_factory=dict)
+    # view_image_urls: {"front": url, "side": url, "back": url}
+    view_image_urls: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -150,6 +162,16 @@ class CharacterConsistencyChecker:
                 result = await session.execute(select(CharacterAnchorModel))
                 rows = result.scalars().all()
                 for row in rows:
+                    view_images = {
+                        "front": row.front_image_path or "",
+                        "side": row.side_image_path or "",
+                        "back": row.back_image_path or "",
+                    }
+                    view_image_urls = {
+                        "front": row.front_image_url or "",
+                        "side": row.side_image_url or "",
+                        "back": row.back_image_url or "",
+                    }
                     anchor = CharacterAnchor(
                         name=row.name,
                         role=row.role or "",
@@ -159,6 +181,8 @@ class CharacterConsistencyChecker:
                         seed=row.seed or 42,
                         traits=json.loads(row.traits_json or "[]"),
                         generation_count=row.generation_count or 0,
+                        view_images=view_images,
+                        view_image_urls=view_image_urls,
                     )
                     self._anchors[anchor.name] = anchor
                 if rows:
@@ -178,24 +202,30 @@ class CharacterConsistencyChecker:
                 result = await session.execute(stmt)
                 existing = result.scalar_one_or_none()
 
+                view_images = anchor.view_images or {}
+                view_image_urls = anchor.view_image_urls or {}
+                fields = {
+                    "role": anchor.role,
+                    "seed_prompt": anchor.seed_prompt,
+                    "seed_image_url": anchor.seed_image_url or "",
+                    "seed_image_path": anchor.seed_image_path or "",
+                    "seed": anchor.seed,
+                    "traits_json": json.dumps(anchor.traits),
+                    "generation_count": anchor.generation_count,
+                    "front_image_path": view_images.get("front", "") or "",
+                    "side_image_path": view_images.get("side", "") or "",
+                    "back_image_path": view_images.get("back", "") or "",
+                    "front_image_url": view_image_urls.get("front", "") or "",
+                    "side_image_url": view_image_urls.get("side", "") or "",
+                    "back_image_url": view_image_urls.get("back", "") or "",
+                }
+
                 if existing:
-                    existing.role = anchor.role
-                    existing.seed_prompt = anchor.seed_prompt
-                    existing.seed_image_url = anchor.seed_image_url or ""
-                    existing.seed_image_path = anchor.seed_image_path or ""
-                    existing.seed = anchor.seed
-                    existing.traits_json = json.dumps(anchor.traits)
-                    existing.generation_count = anchor.generation_count
+                    for k, v in fields.items():
+                        setattr(existing, k, v)
                 else:
                     session.add(CharacterAnchorModel(
-                        name=anchor.name,
-                        role=anchor.role,
-                        seed_prompt=anchor.seed_prompt,
-                        seed_image_url=anchor.seed_image_url or "",
-                        seed_image_path=anchor.seed_image_path or "",
-                        seed=anchor.seed,
-                        traits_json=json.dumps(anchor.traits),
-                        generation_count=anchor.generation_count,
+                        name=anchor.name, **fields,
                     ))
                 await session.commit()
         except Exception as e:
@@ -388,6 +418,138 @@ class CharacterConsistencyChecker:
             return None
         return anchor.seed_image_url or anchor.seed_image_path
 
+    # ================================================================
+    # Multi-view anchor (front / side / back)
+    # ================================================================
+
+    # shot_angle → ref view mapping
+    VIEW_MAPPING = {
+        "close-up": "front",
+        "extreme-close-up": "front",
+        "medium": "front",
+        "wide": "front",
+        "side-angle": "side",
+        "over-shoulder": "side",
+        "back": "back",
+    }
+
+    def register_multi_view_anchor(
+        self,
+        name: str,
+        views: dict[str, str | None],
+        image_urls: dict[str, str | None] | None = None,
+        appearance_text: str = "",
+    ) -> None:
+        """注册多视角 anchor（front/side/back）。
+
+        Args:
+            name: 角色名
+            views: {"front": local_path, "side": local_path, "back": local_path}
+            image_urls: {"front": url, "side": url, "back": url}（可选）
+            appearance_text: 角色 canonical 外貌描述（来自 id_card 原文）。
+                持久化到 seed_prompt，跨集时作为视频/图像生成的一致性约束源。
+        """
+        anchor = self._anchors.get(name)
+        if anchor is None:
+            # 自动注册一个空 anchor（仅 multi-view 数据）
+            logger.warning(
+                "register_multi_view_anchor: '%s' not registered, creating skeleton anchor",
+                name,
+            )
+            anchor = CharacterAnchor(
+                name=name, role="", seed_prompt=appearance_text or "",
+                view_images=dict(views or {}),
+                view_image_urls=dict(image_urls or {}),
+            )
+            self._anchors[name] = anchor
+        else:
+            anchor.view_images = {**(anchor.view_images or {}), **(views or {})}
+            anchor.view_image_urls = {
+                **(anchor.view_image_urls or {}),
+                **(image_urls or {}),
+            }
+            # 仅在 anchor 尚无 canonical appearance 时写入，避免被后续集覆盖
+            # （保证第 1 集生成的外观描述成为全系列唯一基准）
+            if appearance_text and not anchor.seed_prompt:
+                anchor.seed_prompt = appearance_text
+
+        # 若 front 视图存在但 seed_image 未设置，用 front 作为默认 seed_image
+        # （保持向后兼容：旧的 get_anchor_ref_image 仍可用）
+        front_path = anchor.view_images.get("front", "")
+        front_url = anchor.view_image_urls.get("front", "")
+        if front_path and not anchor.seed_image_path:
+            anchor.seed_image_path = front_path
+        if front_url and not anchor.seed_image_url:
+            anchor.seed_image_url = front_url
+
+        logger.info(
+            "Multi-view anchor registered: %s (views=%s)",
+            name,
+            {k: bool(v) for k, v in (anchor.view_images or {}).items()},
+        )
+
+        # 异步持久化
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._persist_anchor(anchor))
+        except RuntimeError:
+            pass
+
+    def has_multi_view(self, name: str) -> bool:
+        """检查角色是否有多视角 anchor（至少含 front）。"""
+        anchor = self._anchors.get(name)
+        if anchor is None:
+            return False
+        views = anchor.view_images or {}
+        # 至少 front 必须有（其他视图可选）
+        return bool(views.get("front"))
+
+    def get_best_ref_view(self, name: str, shot_angle: str) -> Optional[str]:
+        """根据 shot_angle 返回最佳 ref_image path/url。
+
+        映射规则：
+            close-up / extreme-close-up → front
+            medium / wide              → front
+            side-angle / over-shoulder → side
+            back                        → back
+
+        若对应视图不存在，回退到 front；front 也不存在则回退到 seed_image。
+        """
+        anchor = self._anchors.get(name)
+        if anchor is None:
+            return None
+
+        target_view = self.VIEW_MAPPING.get((shot_angle or "").lower(), "front")
+        views = anchor.view_images or {}
+        urls = anchor.view_image_urls or {}
+
+        # 优先返回 URL（远程可访问），其次本地路径
+        if urls.get(target_view):
+            return urls[target_view]
+        if views.get(target_view):
+            return views[target_view]
+
+        # 回退到 front
+        if target_view != "front":
+            if urls.get("front"):
+                return urls["front"]
+            if views.get("front"):
+                return views["front"]
+
+        # 最终回退到 seed_image（旧 anchor）
+        return anchor.seed_image_url or anchor.seed_image_path
+
+    def get_canonical_appearance(self, name: str) -> str:
+        """返回角色 canonical 外貌描述（跨集唯一基准）。
+
+        用于注入到视频生成 prompt，确保 25 集动画过程中角色外观不偏移。
+        来源：generate_multi_view_anchors 时从 id_card 原文构建并持久化到 seed_prompt。
+        """
+        anchor = self._anchors.get(name)
+        if anchor is None:
+            return ""
+        return anchor.seed_prompt or ""
+
     def list_anchors(self) -> list[dict]:
         return [
             {
@@ -395,6 +557,8 @@ class CharacterConsistencyChecker:
                 "role": a.role,
                 "generations": a.generation_count,
                 "has_image": bool(a.seed_image_url or a.seed_image_path),
+                "has_multi_view": bool((a.view_images or {}).get("front")),
+                "views": {k: bool(v) for k, v in (a.view_images or {}).items()},
             }
             for a in self._anchors.values()
         ]

@@ -1,7 +1,7 @@
-﻿"""Long-term memory — cross-episode context via Redis + in-memory L1 cache.
+"""Long-term memory — cross-episode context via Redis + in-memory L1 cache.
 
 Stores character arcs, plot summaries, key events, and foreshadowing
-across 60 episodes so later episodes maintain narrative continuity.
+across all episodes so later episodes maintain narrative continuity.
 
 设计：
 - L1 缓存：进程内存 dict（热数据，零延迟）
@@ -36,7 +36,7 @@ class LongTermMemory:
     """Cross-episode memory for narrative continuity.
 
     Accumulates character states, plot developments, key events, and
-    foreshadowing as the 60-episode series progresses so the Writer
+    foreshadowing as the series progresses so the Writer
     agent can reference past events without repeating context.
 
     双层存储：

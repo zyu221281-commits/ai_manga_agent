@@ -1,6 +1,6 @@
 """单集状态（Pydantic BaseModel）
 
-LangGraph 工作流：
+V5 LangGraph 工作流：
   顶层图: CreativePhase子图 → Writer∥AssetManager并行 → Composer → QualityGate子图
   CreativePhase子图: CreativeDirector → GapAnalysis → Planner → StoryCritic
   QualityGate子图: Critic → SafetyCheck → T0-T3分层路由 → END/DLQ
@@ -70,6 +70,9 @@ class EpisodeState(BaseModel):
     script: dict[str, Any] = Field(default_factory=dict)
     storyboard: list[dict[str, Any]] = Field(default_factory=list)
     image_prompts: list[dict[str, Any]] = Field(default_factory=list)
+    # Structured visual description (one visual_spec per shot)
+    # 由 VisualDescriptor.build_all() 生成，PromptTemplateEngine 渲染为最终 prompt
+    visual_specs: list[dict[str, Any]] = Field(default_factory=list)
 
     # ---- AssetManager 输出 ----
     asset_library: dict[str, Any] = Field(default_factory=dict)

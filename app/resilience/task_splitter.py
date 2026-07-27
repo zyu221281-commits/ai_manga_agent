@@ -1,6 +1,7 @@
-﻿"""任务拆分器（ 韧性加固）
+"""任务拆分器（V4 韧性加固）
 
-60 集 → 60 个独立 Celery 链，单集失败不阻塞其他集，可独立重试。
+N 集 → N 个独立 Celery 链，单集失败不阻塞其他集，可独立重试。
+总集数默认从 settings.DEFAULT_TOTAL_EPISODES 读取（默认 30）。
 """
 
 from __future__ import annotations
@@ -32,9 +33,9 @@ class SeriesTaskPlan:
 
 
 class TaskSplitter:
-    """将 60 集系列拆分为独立任务，计算调度顺序。
+    """将系列拆分为独立任务，计算调度顺序。
 
-     策略：
+    V4 策略：
     - 每集一个独立 Celery task
     - 并行度 = 3（同时最多 3 集运行）
     - 依赖链：第 n 集的 Planner 可能依赖第 n-1 集的前情摘要
@@ -42,13 +43,17 @@ class TaskSplitter:
 
     MAX_PARALLEL = 3
 
-    def split(self, series_id: str, total_episodes: int = 60) -> SeriesTaskPlan:
+    def split(self, series_id: str, total_episodes: int = None) -> SeriesTaskPlan:
         """拆分系列为独立任务。
 
         Args:
             series_id: 系列 ID
-            total_episodes: 总集数（默认 60）
+            total_episodes: 总集数。None 时使用 settings.DEFAULT_TOTAL_EPISODES（默认 30）
         """
+        if total_episodes is None:
+            from app.core.config import settings
+            total_episodes = settings.DEFAULT_TOTAL_EPISODES
+        total_episodes = max(1, int(total_episodes))
         episodes = []
         for i in range(1, total_episodes + 1):
             deps = [i - 1] if i > 1 else []

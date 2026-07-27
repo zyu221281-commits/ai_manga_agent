@@ -1,4 +1,4 @@
-﻿"""Episode task: Celery + LangGraph  production entry point.
+"""Episode task: Celery + LangGraph V5 production entry point.
 
 Replaces the old manual _run_pipeline with graph.ainvoke().
 Supports GraphInterrupt for Creative Gate and Quality Gate.
@@ -47,6 +47,21 @@ def _ensure_checkpointer_tables():
         logger.warning("setup_langgraph_tables skipped: %s", e)
 
 
+async def _load_character_anchors():
+    """加载已持久化的角色 anchor 到内存缓存（跨集一致性关键）。
+
+    每集启动时调用，确保第 N 集能复用第 1 集生成并持久化到 DB 的三视图 anchor，
+    实现"用户输入 25 集时，每一次视频生成的角色画像都不会变迁"。
+    PG 不可用时静默失败，管线继续运行（首集会现场生成 anchor）。
+    """
+    try:
+        from app.quality.character_consistency import character_consistency
+        await character_consistency.ensure_table_created()
+        await character_consistency.load_all_anchors()
+    except Exception as e:
+        logger.warning("load_character_anchors skipped: %s", e)
+
+
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=120, acks_late=True, name="app.tasks.episode_task.run_episode_task")
 def run_episode_task(self, series_id: str, episode_num: int, creative_brief: Optional[dict] = None, series_plan: Optional[dict] = None, asset_library: Optional[dict] = None, checkpointer=None) -> dict:
     episode_id = f"{series_id}_ep_{episode_num}"
@@ -63,9 +78,16 @@ def run_episode_task(self, series_id: str, episode_num: int, creative_brief: Opt
         initial_state = EpisodeState(episode_id=episode_id, series_id=series_id, episode_num=episode_num, trace_id=trace_id, creative_brief=creative_brief or {}, series_plan=series_plan or {}, asset_library=asset_library or {})
         graph = compile_episode_graph(checkpointer=checkpointer)
         config = {"configurable": {"thread_id": episode_id}}
+
+        # Load DB-persisted anchors at episode start for cross-episode consistency
+        # 确保第 25 集能复用第 1 集生成的三视图（跨集一致性关键）
+        async def _run_graph():
+            await _load_character_anchors()
+            return await graph.ainvoke(initial_state, config)
+
         # celery task 是 sync 函数，用 asyncio.run() 驱动 ainvoke
         # （与上方 idempotency_lock.try_acquire / release 一致）
-        final_state = asyncio.run(graph.ainvoke(initial_state, config))
+        final_state = asyncio.run(_run_graph())
         try:
             tracer = FileLineageTracker(trace_id=trace_id)
             tracer.flush()

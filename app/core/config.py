@@ -44,12 +44,12 @@ class Settings(BaseSettings):
     COST_ALERT_THRESHOLD: float = 0.8
     COST_HARD_STOP_THRESHOLD: float = 1.0
 
-    # === 视频分级策略 ===
+    # === 视频分级策略（V4 参数化）===
     VIDEO_KEY_SCENE_RATIO: float = 0.20
     VIDEO_KEY_SCENE_MODEL: str = "volcengine-video"
     VIDEO_AB_TEST_ENABLED: bool = True
 
-    # === Critic 质量门 ===
+    # === Critic 质量门（V4 可配置阈值）===
     CRITIC_PASS_THRESHOLD: float = 0.8
     CRITIC_REVIEW_THRESHOLD: float = 0.6
     CRITIC_MAX_RETRY: int = 2
@@ -59,6 +59,12 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     LOG_LEVEL: str = "INFO"
     ALERT_WEBHOOK_URL: str = ""
+
+    # === 系列集数配置 ===
+    # 默认总集数（用户未输入时使用）。原先硬编码为 60，现改为可配置，默认 30。
+    # 上限保护：避免用户误输入超大值导致 LLM token 爆炸。
+    DEFAULT_TOTAL_EPISODES: int = 30
+    MAX_TOTAL_EPISODES: int = 200
 
     # === 安全配置 ===
     # CORS 允许的源列表，逗号分隔（如 "http://localhost:3000,https://app.example.com"）
@@ -81,7 +87,7 @@ class Settings(BaseSettings):
     NEGATIVE_PROMPT: str = "low quality, deformed, bad anatomy, extra fingers, extra limbs, blurry, watermark, text"
     STYLE_SIMILARITY_THRESHOLD: float = 0.85  # CLIP 风格相似度阈值
 
-    # === 内容质检（生成后拦截）===
+    # === 阶段4: 内容质检（生成后拦截）===
     # ContentGate: CLIP 风格相似度 + 角色一致性检查（图像→视频之间）
     CONTENT_GATE_ENABLED: bool = True
     # VQA: 轻量视觉问答，仅检查 KEY_SCENE 物理异常

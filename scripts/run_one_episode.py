@@ -1,4 +1,4 @@
-"""AI-漫剧 单集完整管线 Runner — 通过 LangGraph graph.ainvoke() 执行"""
+"""AI-漫剧 单集完整管线 Runner V5 — 通过 LangGraph graph.ainvoke() 执行"""
 
 import asyncio, json, os, sys, time, logging
 from pathlib import Path
@@ -26,7 +26,7 @@ CREATIVE_BRIEF = {
     "theme": "修仙逆袭",
     "genre": "玄幻热血",
     "tone": "热血激昂",
-    "total_episodes": 60,
+    "total_episodes": 30,
     "target_audience": "18-35岁男性",
     "style": "anime_comic",
     "summary": "少年林风天生废脉，被视为宗门耻辱。一日意外获得上古龙魂传承，从此逆天改命。从被逐出宗门到横扫九州，他誓要以凡人之躯比肩神明。",
@@ -50,7 +50,7 @@ async def main():
     tracer = FileLineageTracker(trace_id=trace_id)
 
     print("=" * 60)
-    print("AI-Manga Drama: 1 Episode Pipeline (via LangGraph)")
+    print("AI-Manga Drama V5: 1 Episode Pipeline (via LangGraph)")
     print("=" * 60)
     print(f"Series: {SERIES} | Episode: {EP_NUM}")
     print(f"Theme: {CREATIVE_BRIEF['theme']} | Genre: {CREATIVE_BRIEF['genre']}")

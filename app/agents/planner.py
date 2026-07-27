@@ -1,10 +1,11 @@
-﻿"""Planner Agent：60 集大纲 + 调度 + 记忆注入
+"""Planner Agent：系列大纲 + 调度 + 记忆注入
 
- 文档 6.1：
+V4 文档 6.1：
 - 输入: CreativeBrief（来自 RPA 采集层）
-- 输出: SeriesPlan（60 集大纲 + 调度顺序 + 记忆摘要）
-- LLM: DeepSeek--Pro
+- 输出: SeriesPlan（系列大纲 + 调度顺序 + 记忆摘要）
+- LLM: DeepSeek-V4-Pro
 - 成本上报: 每次 LLM 调用记录到 cost_ledger
+- 集数来源（优先级）：creative_brief["episode_count"] > settings.DEFAULT_TOTAL_EPISODES
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ PLANNER_PROMPT = """你是漫剧编剧策划师，请根据以下创意简报，
 
 
 class PlannerAgent(BaseAgent):
-    """Planner Agent：生成 60 集系列大纲 + 调度顺序。"""
+    """Planner Agent：生成系列大纲 + 调度顺序。"""
 
     agent_name = "planner"
 
@@ -59,13 +60,22 @@ class PlannerAgent(BaseAgent):
 
         Args:
             creative_brief: RPA 采集层输出的创意简报
+                - 可选字段 episode_count: 用户指定集数（不传则使用 settings.DEFAULT_TOTAL_EPISODES）
             hot_trends: 热度趋势关键词列表（可选）
             creative_guidance: Creative Director 输出的创意指导方针（可选）
         """
-        # 从 brief 读取 episode_count（默认 60，保持生产环境向后兼容）
-        # 测试场景可在 brief 中传 episode_count=1 大幅节省 token
-        episode_count = int(creative_brief.get("episode_count", 60))
-        episode_count = max(1, min(episode_count, 60))  # 限制 1-60
+        # 集数来源（优先级）：
+        #   1. creative_brief["episode_count"]（用户输入）
+        #   2. settings.DEFAULT_TOTAL_EPISODES（默认 30）
+        # 上限保护：MAX_TOTAL_EPISODES（避免误输入导致 token 爆炸）
+        from app.core.config import settings
+        default_eps = settings.DEFAULT_TOTAL_EPISODES
+        max_eps = settings.MAX_TOTAL_EPISODES
+        try:
+            episode_count = int(creative_brief.get("episode_count", default_eps))
+        except (TypeError, ValueError):
+            episode_count = default_eps
+        episode_count = max(1, min(episode_count, max_eps))
 
         guidance_text = ""
         if creative_guidance:
@@ -84,7 +94,7 @@ class PlannerAgent(BaseAgent):
         try:
             plan_json = await self._llm_json(
                 messages=messages,
-                model="deepseek--pro",
+                model="deepseek-v4-pro",
                 temperature=0.8,
                 max_tokens=32768,
             )
@@ -116,7 +126,7 @@ class PlannerAgent(BaseAgent):
                 episode_id=self.episode_id or "series",
                 artifact_type="series_plan",
                 artifact_data=series_plan,
-                model_name="deepseek--pro",
+                model_name="deepseek-v4-pro",
                 model_params={"temperature": 0.8, "max_tokens": 32768},
                 trace_id=self.trace_id,
             )

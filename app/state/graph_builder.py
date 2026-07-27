@@ -1,4 +1,4 @@
-"""LangGraph episode pipeline with subgraphs, parallel execution, and dual gates."""
+"""LangGraph V5: episode pipeline with subgraphs, parallel execution, and dual gates."""
 
 from __future__ import annotations
 
@@ -233,7 +233,7 @@ async def writer_node(state: EpisodeState) -> dict[str, Any]:
         _emit({"event": "writer", "step": "checkpoint_hit",
                "shots": len(saved_script.get("storyboard", [])),
                "prompts": len(saved_script.get("image_prompts", []))})
-        return {"status": "written", "script": saved_script.get("script"), "storyboard": saved_script.get("storyboard"), "image_prompts": saved_script.get("image_prompts"), "total_cost_usd": 0.0}
+        return {"status": "written", "script": saved_script.get("script"), "storyboard": saved_script.get("storyboard"), "image_prompts": saved_script.get("image_prompts"), "visual_specs": saved_script.get("visual_specs", []), "total_cost_usd": 0.0}
 
     series_plan = state.series_plan
     episodes = series_plan.get("episodes", []) if series_plan else []
@@ -261,13 +261,14 @@ async def writer_node(state: EpisodeState) -> dict[str, Any]:
         pass
     _emit({"event": "writer", "step": "done",
            "shots": len(script_pkg.get("storyboard", [])),
-           "prompts": len(script_pkg.get("image_prompts", []))})
+           "prompts": len(script_pkg.get("image_prompts", [])),
+           "visual_specs": len(script_pkg.get("visual_specs", []))})
 
     # 保存到 checkpoint（断点续传：崩溃后重启直接加载，不重新调 LLM）
     ckpt.save("script", shot_id=0, result=script_pkg)
     _emit({"event": "writer", "step": "checkpoint_saved"})
 
-    return {"status": "written", "script": script_pkg.get("script"), "storyboard": script_pkg.get("storyboard"), "image_prompts": script_pkg.get("image_prompts"), "total_cost_usd": cost}
+    return {"status": "written", "script": script_pkg.get("script"), "storyboard": script_pkg.get("storyboard"), "image_prompts": script_pkg.get("image_prompts"), "visual_specs": script_pkg.get("visual_specs", []), "total_cost_usd": cost}
 
 
 async def shot_validator_node(state: EpisodeState) -> dict[str, Any]:
@@ -318,6 +319,23 @@ async def asset_manager_node(state: EpisodeState) -> dict[str, Any]:
     async with _node_session() as session:
         agent = AssetManagerAgent(session=session, episode_id=state.episode_id, series_id=state.series_id, trace_id=tid, tracer=tracer)
         result = await agent._run_with_tracking(series_plan=state.series_plan)
+        # Multi-view anchor pre-generation for cross-episode consistency
+        # execute() 返回 asset_library 后，为每个角色生成三视图 anchor 并持久化到 DB。
+        # 首集生成三视图，后续集 load_all_anchors 已加载 → has_multi_view 命中 → 跳过。
+        # 失败不阻塞管线（非阻断），composer 仍可用 id_card 文本约束兜底。
+        if result.success and result.data.get("characters"):
+            try:
+                result.data = await agent.generate_multi_view_anchors(result.data)
+                mv_count = sum(
+                    1 for c in result.data.get("characters", [])
+                    if c.get("view_images")
+                )
+                _emit({"event": "asset_manager", "step": "multi_view",
+                       "anchors": mv_count})
+            except Exception as e:
+                logger.warning("Multi-view anchor generation failed (non-blocking): %s", e)
+                _emit({"event": "asset_manager", "step": "multi_view_failed",
+                       "error": str(e)[:120]})
     # 注意：asset_manager 与 writer 并行运行，不返回 status/error_message（避免 last_value 冲突）
     # total_cost_usd 使用 Annotated[float, operator.add] reducer，可安全并行写入
     if not result.success:
@@ -444,6 +462,15 @@ async def composer_classify_node(state):
     async with _node_session() as session:
         agent = ComposerAgent(session=session, episode_id=state.episode_id, series_id=state.series_id, trace_id=state.trace_id)
         classified = agent._classify_scenes(state.storyboard, state.image_prompts, state.script)
+
+    # Inject visual_spec into each classified_scene for deterministic rendering
+    # 让 composer_image_gen_node 能用 PromptTemplateEngine 渲染 + 按 camera_angle 选 ref
+    visual_specs_by_shot = {vs.get("shot_id"): vs for vs in (state.visual_specs or [])}
+    for cs in classified:
+        shot_id = cs.get("shot_id")
+        if shot_id is not None and shot_id in visual_specs_by_shot:
+            cs["visual_spec"] = visual_specs_by_shot[shot_id]
+
     key_count = sum(1 for s in classified if s.get("type") == "key")
     writer({"event": "composer", "step": "classified", "scenes": len(classified), "key": key_count})
     return {"composer_classified_scenes": classified, "composer_step": "classified"}
@@ -517,11 +544,64 @@ async def composer_image_gen_node(state):
 async def composer_tts_gen_node(state):
     from app.agents.composer import ComposerAgent
     from app.services.checkpoint_manager import CheckpointManager
+    from app.resilience.adapters.tts_adapter import get_tts_adapter
     writer = get_stream_writer()
     writer({"event": "composer", "step": "tts_gen_start"})
     async with _node_session() as session:
         agent = ComposerAgent(session=session, episode_id=state.episode_id, series_id=state.series_id, trace_id=state.trace_id)
         audio_segments, subtitle_data = await agent._generate_audio(state.script or {}, state.asset_library or {}, state.storyboard)
+
+    # ================================================================
+    # TTS 质量校验 + Checkpoint 恢复 + 重新生成
+    # 音画对齐前置约束：视频生成要求 TTS 真实时长，故 TTS 必须有效
+    # ================================================================
+    ckpt = CheckpointManager(episode_id=state.episode_id)
+    adapter = get_tts_adapter()
+    invalid_count = 0
+    recovered_count = 0
+    regenerated_count = 0
+
+    for i, seg in enumerate(audio_segments):
+        r = seg.get("result")
+        text = seg.get("text", "")
+        ok, reason = agent._validate_tts_result(r, text)
+        if ok:
+            continue
+
+        invalid_count += 1
+        writer({"event": "composer", "step": "tts_invalid",
+                "shot_id": seg.get("shot_id"), "reason": reason[:120]})
+        logger.warning(
+            "TTS invalid (shot %s): %s — attempting recovery",
+            seg.get("shot_id"), reason,
+        )
+
+        # 恢复：checkpoint 优先 → 重新生成
+        recovered_seg = await agent._recover_tts_segment(seg, ckpt, adapter)
+        new_r = recovered_seg.get("result")
+        new_ok, _ = agent._validate_tts_result(new_r, text)
+        if new_ok:
+            audio_segments[i] = recovered_seg
+            # 判断恢复来源（checkpoint 还是重生）
+            if new_r.cost_usd == 0.0 and new_r.model == "":
+                recovered_count += 1
+            else:
+                regenerated_count += 1
+        else:
+            logger.error(
+                "TTS recovery failed for shot %s: keeping invalid result",
+                seg.get("shot_id"),
+            )
+
+    writer({"event": "composer", "step": "tts_validated",
+            "invalid": invalid_count, "recovered": recovered_count,
+            "regenerated": regenerated_count})
+    if invalid_count > 0:
+        logger.info(
+            "TTS validation: %d invalid, %d recovered from checkpoint, %d regenerated",
+            invalid_count, recovered_count, regenerated_count,
+        )
+
     # 累加 TTS 成本（audio_segments 中每项有 result.cost_usd）
     cost = 0.0
     for seg in audio_segments:
@@ -529,18 +609,22 @@ async def composer_tts_gen_node(state):
         if r and hasattr(r, "cost_usd"):
             cost += r.cost_usd
         # Save successful TTS result to checkpoint for crash recovery
+        # （仅校验通过的 TTS 才写入，避免污染 checkpoint）
         if hasattr(r, "local_path") and getattr(r, "local_path", None):
             shot_id = seg.get("shot_id", 0)
-            ckpt = CheckpointManager(episode_id=state.episode_id)
-            ckpt.save("tts", shot_id, {
-                "local_path": r.local_path,
-                "text": getattr(r, "text", ""),
-                "voice_id": getattr(r, "voice_id", ""),
-                "duration_s": getattr(r, "duration_s", 0),
-                "cost_usd": getattr(r, "cost_usd", 0),
-                "type": seg.get("type", ""),
-                "character": seg.get("character", ""),
-            })
+            ok, _ = agent._validate_tts_result(r, seg.get("text", ""))
+            if ok:
+                ckpt.save("tts", shot_id, {
+                    "local_path": r.local_path,
+                    "text": getattr(r, "text", ""),
+                    "voice_id": getattr(r, "voice_id", ""),
+                    "duration_s": getattr(r, "duration_s", 0),
+                    "cost_usd": getattr(r, "cost_usd", 0),
+                    "model": getattr(r, "model", ""),
+                    "type": seg.get("type", ""),
+                    "character": seg.get("character", ""),
+                    "word_timestamps": getattr(r, "word_timestamps", []),
+                })
     writer({"event": "composer", "step": "tts_gen_done", "segments": len(audio_segments)})
     return {"composer_audio_ready": True, "composer_audio_segments": audio_segments, "composer_subtitle_data": subtitle_data, "total_cost_usd": cost}
 
@@ -569,7 +653,25 @@ async def composer_video_gen_node(state):
             else:
                 image_results.append(ImageResult(url="", local_path="", prompt="",
                                                  width=1080, height=1920, model="", cost_usd=0.0))
-        videos = await agent._generate_videos(classified, image_results, settings.VIDEO_KEY_SCENE_RATIO)
+
+        # 音画对齐硬约束：从已校验的 TTS 结果聚合 shot_durations
+        # 未传 shot_durations 时 _generate_videos 会跳过所有 shot（防音画不同步）
+        shot_durations: dict[int, float] = {}
+        for a in (state.composer_audio_segments or []):
+            tts = a.get("result")
+            if not tts or not getattr(tts, "duration_s", 0):
+                continue
+            sid = a.get("shot_id")
+            if sid is not None:
+                shot_durations[sid] = shot_durations.get(sid, 0.0) + tts.duration_s
+        if shot_durations:
+            writer({"event": "composer", "step": "video_durations_ready",
+                    "shots_with_tts": len(shot_durations)})
+
+        videos = await agent._generate_videos(
+            classified, image_results, settings.VIDEO_KEY_SCENE_RATIO,
+            shot_durations=shot_durations,
+        )
     # 保存完整视频结果（含 duration_s, url, local_path, cost_usd）
     video_results_data = [
         {"url": v.url, "local_path": v.local_path or "", "duration_s": v.duration_s,

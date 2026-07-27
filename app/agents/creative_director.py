@@ -1,10 +1,10 @@
-﻿"""Creative Director Agent — multi-concept exploration + creative guidance.
+"""Creative Director Agent — multi-concept exploration + creative guidance.
 
 Takes a raw creative brief and generates 3-5 distinct creative concepts,
 evaluates each for viral potential / differentiation / executability,
 selects the best direction, and outputs creative guidance for the Planner.
 
-: Creative Layer — the meta-level creative engine.
+V5: Creative Layer — the meta-level creative engine.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ Generate 3-5 DISTINCT creative concepts from this brief. Each concept should hav
 1. concept_name: A punchy name for this creative direction (≤15 chars)
 2. tone: The dominant emotional tone (pick one primary + one secondary)
 3. twist_pattern: The unique narrative trick/mechanic that makes this stand out
-4. emotional_arc: The emotional journey across 60 episodes (3-phase arc)
+4. emotional_arc: The emotional journey across {episode_count} episodes (3-phase arc)
 5. target_hook: The 15-word hook that makes viewers click
 6. visual_style_keyword: 3-5 keywords defining the visual aesthetic
 7. differentiation: Why this is different from typical stories in this genre
@@ -43,7 +43,7 @@ Generate 3-5 DISTINCT creative concepts from this brief. Each concept should hav
       "concept_name": "creative direction name",
       "tone": {{"primary": "dark|light|tense|warm|quirky|epic", "secondary": "..."}},
       "twist_pattern": "describe the unique narrative mechanic",
-      "emotional_arc": {{"phase1": "1-20 episodes", "phase2": "21-40 episodes", "phase3": "41-60 episodes"}},
+      "emotional_arc": {{"phase1": "early episodes", "phase2": "middle episodes", "phase3": "late episodes"}},
       "target_hook": "one-line hook",
       "visual_style_keyword": ["keyword1", "keyword2", "keyword3"],
       "differentiation": "why different",
@@ -146,9 +146,18 @@ class CreativeDirectorAgent(BaseAgent):
         num_concepts: int,
     ) -> list[dict]:
         """Phase 1: Generate 3-5 distinct creative concepts."""
+        # 集数：从 brief 读取，回退到 settings.DEFAULT_TOTAL_EPISODES
+        from app.core.config import settings
+        try:
+            episode_count = int(creative_brief.get("episode_count", settings.DEFAULT_TOTAL_EPISODES))
+        except (TypeError, ValueError):
+            episode_count = settings.DEFAULT_TOTAL_EPISODES
+        episode_count = max(1, min(episode_count, settings.MAX_TOTAL_EPISODES))
+
         prompt = CREATIVE_CONCEPT_PROMPT.format(
             creative_brief=json.dumps(creative_brief, ensure_ascii=False, indent=2),
             hot_trends=json.dumps(hot_trends or [], ensure_ascii=False),
+            episode_count=episode_count,
         )
         prompt += f"\n\nPlease generate exactly {num_concepts} distinct concepts."
 
@@ -160,7 +169,7 @@ class CreativeDirectorAgent(BaseAgent):
         try:
             result = await self._llm_json(
                 messages=messages,
-                model="deepseek--pro",
+                model="deepseek-v4-pro",
                 temperature=0.9,
                 max_tokens=8192,
             )
@@ -193,7 +202,7 @@ class CreativeDirectorAgent(BaseAgent):
                     {"role": "system", "content": "You are a creative director. Pick the single most viral-worthy concept."},
                     {"role": "user", "content": eval_prompt},
                 ],
-                model="deepseek--pro",
+                model="deepseek-v4-pro",
                 temperature=0.5,
                 max_tokens=1024,
             )
@@ -223,7 +232,7 @@ class CreativeDirectorAgent(BaseAgent):
                     {"role": "system", "content": "You are a creative director translating concepts into production guidance. Output strict JSON."},
                     {"role": "user", "content": prompt},
                 ],
-                model="deepseek--pro",
+                model="deepseek-v4-pro",
                 temperature=0.6,
                 max_tokens=2048,
             )

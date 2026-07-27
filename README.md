@@ -18,7 +18,10 @@
 - **断点续传**：基于 Checkpoint 的故障恢复机制，崩溃后从失败点继续
 - **成本可观测**：完整的 LLM/图像/视频成本追踪与预算控制
 - **Seed Audio 1.0 整合**：TTS + 背景音 + BGM 一站式音频生成
-- **角色一致性保障**：固定 seed + 身份证特征，确保多集角色形象统一
+- **角色一致性三重保障**：固定 seed + 身份证特征 + 三视图锚点（front/side/back），跨集角色形象零漂移
+- **跨集角色锚点持久化**：首集生成三视图 + canonical appearance 写入 DB，后续集自动加载复用
+- **音画对齐硬约束**：TTS 6 项质量校验 + 视频生成严格使用 TTS 真实时长，杜绝音画不同步
+- **剧集数可配置**：用户输入指定集数，不输入默认 30 集（上限 200 集保护）
 
 ## 🏗️ 技术架构
 
@@ -166,12 +169,17 @@ ai_manga_agent/
 │   │   ├── story_critic.py       # 大纲吸引力评估
 │   │   ├── writer.py             # 剧本 + 分镜 + 提示词
 │   │   ├── shot_validator.py     # 分镜逻辑质检
-│   │   └── composer.py           # 图像→视频→音频合成
+│   │   ├── composer.py           # 图像→视频→音频合成
+│   │   └── pipeline/             # Composer 管线编排
+│   │       ├── context.py        # 管线上下文
+│   │       └── orchestrator.py   # 编排器
 │   ├── api/                      # FastAPI 路由
 │   ├── core/                     # 配置与工具
 │   ├── services/                 # 业务服务
 │   ├── state/                    # LangGraph 状态与图定义
 │   ├── quality/                  # 质量控制模块
+│   │   ├── visual_descriptor.py  # 视觉描述规范化
+│   │   └── character_consistency.py # 角色锚点 + 三视图
 │   ├── resilience/               # 韧性与适配器
 │   └── tasks/                    # Celery 任务
 ├── scripts/                      # 运行脚本
@@ -203,7 +211,7 @@ sequenceDiagram
     
     G->>CD: 创意缺口分析 + 概念探索
     CD-->>G: creative_guidance
-    G->>P: 60集大纲规划
+    G->>P: 系列大纲规划（默认30集，可配置）
     P-->>G: series_plan
     G->>SC: 大纲质量评估
     SC-->>G: outline_score
@@ -240,7 +248,7 @@ sequenceDiagram
 | Agent | 职责 | 输出 |
 |-------|------|------|
 | **CreativeDirector** | 探索 3-5 种创意方向，评估病毒传播潜力，选择最优方案 | creative_guidance |
-| **Planner** | 生成 60 集系列大纲，设计角色成长弧线，规划悬念钩子 | series_plan |
+| **Planner** | 生成系列大纲（默认 30 集，可配置），设计角色成长弧线，规划悬念钩子 | series_plan |
 | **StoryCritic** | 双模型投票评估大纲吸引力（冲突密度/反转频率/角色弧线） | outline_score |
 | **Writer** | 剧本创作 + 分镜设计 + 图像提示词 + 伏笔管理 | script + storyboard + prompts |
 | **ShotValidator** | 检查空间连续性、角色一致性、镜头节奏、提示词完整性 | validation_result |
@@ -251,7 +259,24 @@ sequenceDiagram
 ### ContentGate（生成前）
 
 - **CLIP 风格相似度**：相邻镜头风格一致性检查
-- **角色一致性**：身份证特征比对，确保同一角色形象统一
+- **角色一致性**：身份证特征比对 + 三视图锚点（front/side/back），确保同一角色形象统一
+
+### 角色一致性深度保障
+
+跨集角色形象零漂移的三重机制：
+
+1. **三视图锚点**：首集为每个角色生成 front/side/back 三个视角的参考图，持久化到 DB
+2. **Canonical Appearance**：从角色身份证 100% 原文复制外貌描述，首集写入后不覆盖（防 drift）
+3. **跨集复用**：每集启动时自动从 DB 加载锚点，按 `camera_angle` 选最佳视角 ref_image
+4. **视频约束**：canonical appearance 注入视频生成 prompt，文本+视觉双重约束
+
+### TTS 质量校验 + 音画对齐
+
+视频生成严格使用 TTS 真实时长，杜绝音画不同步：
+
+- **6 项 TTS 校验**：result 非空 / local_path 非空 / 文件存在 / 文件 ≥1KB / duration ≥0.5s / 时长文本比例 ∈ [0.33, 3.0]
+- **恢复机制**：校验失败时优先从 checkpoint 恢复，否则重新生成（最多 2 次）
+- **硬约束**：无 TTS 时长的 shot 直接跳过视频生成（不使用 storyboard 估算 fallback）
 
 ### VQA Checker（生成后）
 
@@ -319,11 +344,69 @@ quality_gate_pass_rate{tier="T0"}
 ## 🌟 项目亮点
 
 - **LangGraph 最佳实践**：16 节点 DAG + interrupt + checkpointer 完整实现
-- **角色一致性保障**：固定 seed + 身份证特征，多集角色形象不漂移
+- **角色一致性三重保障**：固定 seed + 身份证特征 + 三视图锚点，跨集角色形象零漂移
 - **Seed Audio 整合**：TTS + 背景音 + BGM 一站式，音频质量大幅提升
 - **双质量门禁**：生成前预防 + 生成后拦截，确保内容质量
 - **断点续传**：崩溃后从失败点继续，节省大量重新生成成本
 - **成本可观测**：实时追踪、预算告警、硬止损三重保障
+- **音画对齐硬约束**：TTS 6 项质量校验 + 视频严格使用 TTS 真实时长
+
+## 📝 更新日志
+
+### v2.0.0 — 角色一致性 + 音画对齐深度优化
+
+本次更新围绕"跨集角色一致性"和"音画对齐"两大核心问题进行深度优化，新增 6 个文件，修改 17 个文件。
+
+#### 1. 剧集数可配置化
+
+将硬编码的 60 集改为用户可配置，不输入时默认 30 集（上限 200 集保护）。
+
+- 集数获取链路：`creative_brief["episode_count"]` → `settings.DEFAULT_TOTAL_EPISODES` (30) → 上限保护
+- 涉及文件：`config.py`、`planner.py`、`creative_director.py`、`asset_manager.py`、`series_batch_task.py`、`task_splitter.py`
+
+#### 2. 角色一致性深度优化（文描规范化）
+
+新增 `VisualDescriptor` + `PromptTemplateEngine`，从 storyboard + id_card 自动提取视觉规范。
+
+- 角色 appearance 100% 从 `id_card` 原文复制（零变体）
+- 仅 pose/expression/position 每集自由
+- `camera_angle` 必填，按视角选最佳 ref_image
+- 纯规则引擎，零 LLM 成本
+- 新增文件：[`app/quality/visual_descriptor.py`](app/quality/visual_descriptor.py)
+
+#### 3. 三视图前置约束（跨集一致性）
+
+`CharacterAnchorModel` 增加 front/side/back 三视图字段，首集生成后持久化到 DB，后续集自动加载复用。
+
+- 首集：生成三视图 + canonical appearance 写入 DB（seed_prompt 不覆盖防 drift）
+- 第 2~N 集：启动时 `load_all_anchors()` 加载 → `has_multi_view` 命中跳过 → 视频 prompt 注入同一外貌
+- 图像生成用三视图作 ref_image（视觉约束）
+- 视频生成用 canonical appearance 注入 prompt_text（文本约束）
+- 涉及文件：`character_consistency.py`、`asset_manager.py`、`episode_task.py`、`graph_builder.py`、`composer.py`、`init.sql`
+
+#### 4. TTS 质量校验 + 音画对齐硬约束
+
+修复 `composer_video_gen_node` 未传 `shot_durations` 的既有 bug，并加强 TTS 质量校验。
+
+- **TTS 6 项校验**：result 非空 / local_path 非空 / 文件存在 / 文件 ≥1KB / duration ≥0.5s / 时长文本比例 ∈ [0.33, 3.0]
+- **恢复机制**：校验失败时优先从 checkpoint 恢复（同 shot_id 旧 TTS），否则重新生成（最多 2 次）
+- **硬约束**：`shot_durations=None` 时所有 shot 跳过视频生成；无 TTS 时长的 shot 跳过（不再使用 storyboard 估算 fallback）
+- 仅校验通过的 TTS 才写入 checkpoint（避免污染）
+- 涉及文件：`composer.py`（`_validate_tts_result` + `_recover_tts_segment`）、`graph_builder.py`
+
+#### 兼容性
+
+- 所有改动向后兼容（旧 anchor 自动回退到 seed_image）
+- scene-level 合成策略完全兼容（空 VideoResult 自动过滤）
+- 旧 checkpoint 数据可继续使用（新字段可选）
+
+#### 测试
+
+新增 2 个功能测试脚本：
+- [`scripts/test_cross_episode_consistency.py`](scripts/test_cross_episode_consistency.py) — 三视图跨集一致性验证（7 项断言）
+- [`scripts/test_tts_validation_video_sync.py`](scripts/test_tts_validation_video_sync.py) — TTS 校验 + 音画对齐验证（6 项断言）
+
+---
 
 ## 📄 License
 

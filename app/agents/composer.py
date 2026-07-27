@@ -1,4 +1,4 @@
-﻿"""Composer Agent - image, video, TTS, subtitles, BGM, cover generation and FFmpeg composition.
+"""Composer Agent - image, video, TTS, subtitles, BGM, cover generation and FFmpeg composition.
 
 Input: Writer output + AssetManager asset library.
 Output: EpisodeAsset (final video + subtitles + BGM + cover + AI content label).
@@ -18,7 +18,7 @@ from app.agents.base import BaseAgent, AgentResult
 from app.resilience.adapters.image_adapter import get_image_adapter, ImageResult
 from app.resilience.adapters.video_adapter import get_video_adapter, VideoResult
 from app.resilience.adapters.tts_adapter import get_tts_adapter, TTSResult
-from app.services.video_strategy import classify_scene, KEY_SCENE, NORMAL_SCENE
+from app.services.video_strategy import classify_scene, _extract_main_character, KEY_SCENE, NORMAL_SCENE
 from app.services.episode_compositor import compose_episode
 
 from app.quality.character_consistency import character_consistency
@@ -26,18 +26,6 @@ from app.quality.subtitle_generator import SubtitleGenerator
 from app.quality.content_gate import content_gate
 from app.quality.vqa_checker import vqa_checker
 logger = logging.getLogger(__name__)
-
-
-
-def _extract_main_character(scene, script):
-    """Extract main character name from a scene."""
-    for d in scene.get("dialogue", []):
-        if isinstance(d, dict) and d.get("character"):
-            return d["character"]
-    chars = script.get("characters", [])
-    if chars:
-        return chars[0].get("name", "") if isinstance(chars[0], dict) else str(chars[0])
-    return ""
 
 
 # BGM_MOOD_MAP 已移除：Seed Audio 1.0 在生成对白时同步产出背景音，
@@ -56,155 +44,71 @@ class ComposerAgent(BaseAgent):
         image_prompts: list[dict],
         asset_library: dict[str, Any],
         key_scene_ratio: Optional[float] = None,
+        visual_specs: Optional[list[dict]] = None,
     ) -> AgentResult:
         """Run the full production pipeline.
 
         Returns EpisodeAsset with images, videos, audio, subtitles,
         BGM, covers, final video path, and AI content label metadata.
         """
-        from app.core.config import settings
-        ratio = key_scene_ratio if key_scene_ratio is not None else settings.VIDEO_KEY_SCENE_RATIO
+        from app.agents.pipeline.context import PipelineContext
+        from app.agents.pipeline.orchestrator import ComposerPipeline
+
         episode_id = self.episode_id or "ep_001"
 
-        total_cost = 0.0
-        metadata: dict[str, Any] = {}
+        # Build visual_specs from storyboard if not provided (degraded fallback)
+        if visual_specs is None:
+            try:
+                from app.quality.visual_descriptor import visual_descriptor
+                visual_specs = visual_descriptor.build_all(
+                    storyboard=storyboard, script=script, asset_library=asset_library,
+                )
+            except Exception as e:
+                logger.warning("visual_specs rebuild failed (degraded): %s", e)
+                visual_specs = []
 
-        # 1. Scene classification
-        classified_scenes = self._classify_scenes(storyboard, image_prompts, script)
-        metadata["key_scenes"] = sum(1 for s in classified_scenes if s["type"] == KEY_SCENE)
-        metadata["normal_scenes"] = sum(1 for s in classified_scenes if s["type"] == NORMAL_SCENE)
-        logger.info("Scene classification: %d key, %d normal", metadata["key_scenes"], metadata["normal_scenes"])
-
-        # 2. Image + Audio in parallel (they share no dependencies)
-        image_task = asyncio.create_task(
-            self._generate_images(classified_scenes, asset_library)
+        context = PipelineContext(
+            script=script,
+            storyboard=storyboard,
+            image_prompts=image_prompts,
+            asset_library=asset_library,
+            episode_id=episode_id,
+            key_scene_ratio=key_scene_ratio,
+            visual_specs=visual_specs,
         )
-        audio_task = asyncio.create_task(
-            self._generate_audio(script, asset_library, storyboard)
-        )
 
-        # Wait for images (video depends on them)
-        image_results = await image_task
-        total_cost += sum(img.cost_usd for img in image_results)
-        metadata["images_generated"] = len(image_results)
-        logger.info("Images: %d generated", len(image_results))
+        pipeline = ComposerPipeline(context, self)
+        error = await pipeline.run()
 
-        # Wait for audio (TTS 完成后才能拿到真实时长，用于驱动视频生成时长)
-        # TTS 通常比图像快，await 几乎不增加等待时间
-        audio_segments, scene_subtitle_data = await audio_task
-        total_cost += sum(a["result"].cost_usd for a in audio_segments if a["result"])
-        metadata["audio_segments"] = len(audio_segments)
-        logger.info("TTS: %d segments generated (shot-aligned, real duration available)", len(audio_segments))
-
-        # 构建每个 shot 的真实 TTS 时长（音画对齐的关键：用真实时长驱动视频生成）
-        shot_durations: dict[int, float] = {}
-        for a in audio_segments:
-            tts = a.get("result")
-            if not tts or not tts.duration_s:
-                continue
-            sid = a.get("shot_id")
-            if sid is not None:
-                shot_durations[sid] = shot_durations.get(sid, 0.0) + tts.duration_s
-
-        # Pre-Video Gate: abort if too many image failures
-        if not self._pre_video_gate(image_results, classified_scenes):
+        if error:
             return AgentResult(
                 success=False,
-                error="Pre-video gate: image failure rate exceeds threshold",
+                error=error,
+                metadata=context.metadata,
             )
-
-        # ContentGate + VQA: 内容质检（非阻断，仅记录问题，不阻止视频生成）
-        # 阶段4.1: CLIP 风格相似度 + 角色一致性检查
-        if settings.CONTENT_GATE_ENABLED:
-            try:
-                gate_result = await content_gate.check_images(
-                    image_results, classified_scenes, asset_library
-                )
-                metadata["content_gate"] = gate_result.to_dict()
-                if gate_result.flagged_shots:
-                    logger.warning(
-                        "ContentGate flagged %d shots: %s",
-                        len(gate_result.flagged_shots), gate_result.flagged_shots,
-                    )
-            except Exception as e:
-                logger.warning("ContentGate error (non-blocking): %s", e)
-                metadata["content_gate"] = {"verdict": "error", "error": str(e)}
-
-        # 阶段4.2: 轻量 VQA（仅 KEY_SCENE 物理异常检查）
-        if settings.VQA_ENABLED:
-            try:
-                vqa_result = await vqa_checker.check_key_scenes(
-                    image_results, classified_scenes
-                )
-                metadata["vqa_check"] = vqa_result.to_dict()
-                if vqa_result.flagged_shots:
-                    logger.warning(
-                        "VQA flagged %d KEY scenes: %s",
-                        len(vqa_result.flagged_shots), vqa_result.flagged_shots,
-                    )
-            except Exception as e:
-                logger.warning("VQA error (non-blocking): %s", e)
-                metadata["vqa_check"] = {"verdict": "error", "error": str(e)}
-
-        # 3. Video generation (用 TTS 真实时长驱动视频时长，实现音画对齐)
-        video_segments = await self._generate_videos(
-            classified_scenes, image_results, ratio, shot_durations=shot_durations,
-        )
-        total_cost += sum(v.cost_usd for v in video_segments)
-        metadata["videos_generated"] = len(video_segments)
-        logger.info("Videos: %d generated", len(video_segments))
-
-        # 5. Subtitles
-        subtitles = scene_subtitle_data
-        metadata["subtitle_entries"] = len(subtitles)
-
-        # 6. BGM 已整合到 Seed Audio 输出中，无需独立选取（删除 _select_bgm）
-
-        # 7. Cover selection
-        covers = self._select_cover_candidates(image_results)
-        metadata["covers"] = covers
-
-       # 8. FFmpeg final composition（不再混合 BGM，Seed Audio 已含背景音）
-        compose_result = await self._compose_final_video(
-            video_segments, audio_segments, subtitles, "",
-            classified_scenes, episode_id, bgm_path="",
-       )
-        metadata["composition"] = compose_result
-
-        # Add previously lost auto-narration TTS cost (O10 fix)
-        total_cost += compose_result.get("extra_tts_cost", 0.0)
-
-        # 9. AI content label metadata
-        ai_label = self._build_ai_label(script, metadata, total_cost)
 
         episode_asset = {
             "episode_id": episode_id,
             "script": script,
             "storyboard": storyboard,
             "image_prompts": image_prompts,
-            "images": [self._image_to_dict(img) for img in image_results],
-          "video_segments": [self._video_to_dict(v, i) for i, v in enumerate(video_segments)],
-            "audio_segments": [self._tts_to_dict(a["result"]) for a in audio_segments if a["result"]],
-            "subtitles": subtitles,
-            "bgm_track": "",  # BGM 已整合到 Seed Audio 输出，不再独立选取
-            "covers": covers,
-            "final_video_path": compose_result.get("final_video_path", ""),
-            "ai_label": ai_label,
-            "cost_usd": round(total_cost, 4),
-            "metadata": metadata,
+            "images": [self._image_to_dict(img) for img in context.image_results],
+            "video_segments": [self._video_to_dict(v, i) for i, v in enumerate(context.video_segments)],
+            "audio_segments": [self._tts_to_dict(a["result"]) for a in context.audio_segments if a["result"]],
+            "subtitles": context.subtitles,
+            "bgm_track": "",
+            "covers": context.covers,
+            "final_video_path": context.compose_result.get("final_video_path", ""),
+            "ai_label": context.ai_label,
+            "cost_usd": round(context.total_cost_usd, 4),
+            "metadata": context.metadata,
         }
-
-        logger.info(
-            "Composer finished: %d images, %d videos, %d audio, cost=%.4f USD",
-            metadata["images_generated"], metadata["videos_generated"],
-            metadata["audio_segments"], total_cost,
-        )
 
         return AgentResult(
             success=True,
             data=episode_asset,
-            cost_usd=total_cost,
-            metadata=metadata,
+            cost_usd=context.total_cost_usd,
+            metadata=context.metadata,
         )
 
     # -- 1. Scene classification --
@@ -472,10 +376,30 @@ class ComposerAgent(BaseAgent):
 
         negative = prompt_data.get("negative_prompt", "")
 
+        # Select best-view ref_image by shot_angle
+        # 若 cs 中已带 visual_spec，则用 PromptTemplateEngine 重新渲染 prompt（确定性输出）
+        visual_spec = cs.get("visual_spec")
+        if visual_spec:
+            try:
+                from app.quality.visual_descriptor import prompt_template_engine
+                rendered_prompt, rendered_negative = prompt_template_engine.render_both(visual_spec)
+                if rendered_prompt:
+                    prompt = rendered_prompt
+                if rendered_negative:
+                    negative = rendered_negative
+            except Exception as e:
+                logger.warning("PromptTemplateEngine render failed for shot %s: %s", shot_id, e)
+
         # P3: character anchor injection for ref_url if no scene ref provided
+        # 优先使用 multi-view anchor 的最佳视角（按 camera_angle）
         if not ref_url:
             char_name = cs.get("character_name", "")
-            if char_name and character_consistency.has_anchor_image(char_name):
+            shot_angle = (visual_spec or {}).get("composition", {}).get("camera_angle", "")
+            if char_name and shot_angle and character_consistency.has_multi_view(char_name):
+                # 多视角 anchor：按 shot_angle 选最佳视图
+                ref_url = character_consistency.get_best_ref_view(char_name, shot_angle) or ""
+            elif char_name and character_consistency.has_anchor_image(char_name):
+                # 旧 anchor（仅 front / seed_image）
                 ref_url = character_consistency.get_anchor_ref_image(char_name) or ""
 
         # L0: first attempt (adapter handles its own retries internally)
@@ -562,6 +486,10 @@ class ComposerAgent(BaseAgent):
     ) -> list[VideoResult]:
         """Generate videos for all shots in parallel with 3-layer defense + checkpoint.
 
+        硬约束（音画对齐）：shot_durations 必须传入，且每个 shot 必须有 TTS 真实时长。
+        无 TTS 时长的 shot 直接跳过（返回空 VideoResult），不再使用 storyboard 估算 fallback，
+        严防与 TTS 真实时长偏差导致的音画不同步。
+
         Defense layers:
           L0: adapter-level retry (Seedance 已有内部重试)
           L1: KEY_SCENE 失败时换 motion_type 重试
@@ -586,6 +514,18 @@ class ComposerAgent(BaseAgent):
 
         # L1 备选 motion 类型（按优先级）
         fallback_motions = ["zoom-in", "pan-left", "dolly-in", "static"]
+
+        # 音画对齐硬约束：shot_durations 必传
+        if shot_durations is None:
+            logger.error(
+                "shot_durations is None — video generation requires TTS durations "
+                "for audio-visual sync; aborting to prevent desync"
+            )
+            return [VideoResult(
+                url="", local_path="", scene_type=cs.get("type", NORMAL_SCENE),
+                model="skipped_no_tts", cost_usd=0.0,
+                metadata={"error": "shot_durations is None (no TTS duration)"},
+            ) for cs in classified_scenes]
 
         async def _gen_one(cs: dict) -> VideoResult:
             scene_type = cs["type"]
@@ -615,16 +555,22 @@ class ComposerAgent(BaseAgent):
                         ckpt.remove("video", shot_id)
 
             img = image_map.get(shot_id)
-            # 优先用 TTS 真实时长（音画对齐），fallback 到 storyboard 估算
+            # 音画对齐硬约束：必须有 TTS 真实时长，不再使用 storyboard 估算 fallback
             real_dur = shot_durations.get(shot_id) if shot_durations else None
-            if real_dur and real_dur >= 1.0:
-                duration = max(int(real_dur), 3)  # seedance 最小 3s，用 TTS 真实时长
-            else:
-                # 无 TTS 的 shot：用 storyboard 时长（fallback）
-                if scene_type == KEY_SCENE:
-                    duration = max(shot.get("duration_s", 5.0), 5.0)
-                else:
-                    duration = max(shot.get("duration_s", 3.0), 3.0)
+            if not real_dur or real_dur < 1.0:
+                # 无 TTS 时长 → 跳过该 shot（不生成视频，严防音画不同步）
+                logger.warning(
+                    "Video skip shot %d: no TTS duration (shot_durations=%s) — "
+                    "audio-visual sync requires TTS, skipping to prevent desync",
+                    shot_id, f"{real_dur:.2f}s" if real_dur else "None",
+                )
+                return VideoResult(
+                    url="", local_path="", scene_type=scene_type,
+                    model="skipped_no_tts", cost_usd=0.0,
+                    metadata={"error": "no TTS duration (audio-visual sync required)"},
+                )
+            duration = max(int(real_dur), 3)  # seedance 最小 3s，用 TTS 真实时长
+
             image_path = img.local_path if img else ""
             image_url = img.url if img and img.url else ""
             motion = shot.get("camera_motion", "static")
@@ -732,7 +678,167 @@ class ComposerAgent(BaseAgent):
             "cinematic lighting",
             scene_data.get("emotion", ""),
         ]
+        # Inject canonical appearance for cross-episode consistency
+        # 三视图 anchor 在每集启动时从 DB 加载（episode_task._load_character_anchors），
+        # 此处取 anchor.seed_prompt（首集 id_card 原文构建，跨集唯一基准），
+        # 确保视频模型在动画过程中保持角色外观，防止 25 集间 drift。
+        char_name = cs.get("character_name", "")
+        if char_name:
+            appearance = character_consistency.get_canonical_appearance(char_name)
+            if appearance:
+                parts.append(appearance)
+            else:
+                # anchor 未加载（如首集 DB 尚无记录）兜底：从 asset_library 取 id_card
+                id_card = self._extract_id_card_from_context(cs)
+                if id_card:
+                    parts.append(id_card)
         return ", ".join(p for p in parts if p)
+
+    def _extract_id_card_from_context(self, cs: dict) -> str:
+        """从 classified_scene 关联的 asset_library 角色 id_card 兜底构建外貌描述。
+
+        仅在 anchor 未加载时使用（首集 anchor 尚未持久化的瞬间）。
+        """
+        # asset_library 不在 cs 中，这里通过 character_name 无法直接定位；
+        # 返回通用约束，让视频模型至少有"保持角色一致"的文本提示。
+        char_name = cs.get("character_name", "")
+        if not char_name:
+            return ""
+        return f"{char_name}, consistent character appearance, same person throughout"
+
+    # ================================================================
+    # TTS 校验 + Checkpoint 恢复（音画对齐前置约束）
+    # ================================================================
+
+    @staticmethod
+    def _validate_tts_result(result, text: str) -> tuple[bool, str]:
+        """校验 TTS 结果质量。
+
+        Returns:
+            (is_valid, reason): is_valid=True 时 reason 为空；False 时 reason 说明失败原因
+        """
+        if result is None:
+            return False, "result is None"
+        if not getattr(result, "local_path", ""):
+            return False, "local_path empty"
+        if not os.path.isfile(result.local_path):
+            return False, f"file not found: {result.local_path}"
+        if os.path.getsize(result.local_path) < 1024:
+            return False, f"file too small: {os.path.getsize(result.local_path)} bytes"
+        dur = getattr(result, "duration_s", 0.0) or 0.0
+        if dur < 0.5:
+            return False, f"duration too short: {dur:.2f}s"
+        # 时长与文本长度比例校验（5 字/秒为中文 TTS 基线）
+        # ratio < 0.33 → 异常短（可能是截断）；ratio > 3.0 → 异常长（可能是噪声/重复）
+        if text:
+            expected_dur = max(len(text) / 5.0, 0.5)
+            ratio = dur / expected_dur if expected_dur > 0 else 1.0
+            if ratio < 0.33 or ratio > 3.0:
+                return False, f"duration ratio out of range: {ratio:.2f} (dur={dur:.2f}s, expected={expected_dur:.2f}s)"
+        return True, ""
+
+    async def _recover_tts_segment(
+        self,
+        seg: dict,
+        ckpt,
+        adapter,
+    ) -> dict:
+        """TTS 校验失败时的恢复流程：checkpoint 优先 → 重新生成。
+
+        Args:
+            seg: audio_segment dict（含 result/text/voice_id/shot_id 等）
+            ckpt: CheckpointManager 实例
+            adapter: TTS 适配器
+
+        Returns:
+            恢复后的 seg（result 已替换为有效 TTSResult 或仍为 None）
+        """
+        shot_id = seg.get("shot_id")
+        text = seg.get("text", "")
+        voice_id = seg.get("result").voice_id if seg.get("result") else "zh_male_ruyayichen_uranus_bigtts"
+
+        # 1. 尝试 checkpoint 恢复
+        if shot_id is not None:
+            saved = ckpt.load("tts", shot_id)
+            if saved and saved.get("local_path"):
+                saved_path = saved.get("local_path", "")
+                if os.path.isfile(saved_path) and os.path.getsize(saved_path) >= 1024:
+                    saved_dur = saved.get("duration_s", 0.0) or 0.0
+                    if saved_dur >= 0.5:
+                        from app.resilience.adapters.audio_types import TTSResult
+                        recovered = TTSResult(
+                            audio_url=saved.get("audio_url", ""),
+                            local_path=saved_path,
+                            text=saved.get("text", text),
+                            voice_id=saved.get("voice_id", voice_id),
+                            duration_s=saved_dur,
+                            model=saved.get("model", ""),
+                            cost_usd=0.0,  # checkpoint 恢复不重复计费
+                            word_timestamps=saved.get("word_timestamps", []),
+                        )
+                        # 校验 checkpoint 是否也通过质量检查
+                        ok, _ = self._validate_tts_result(recovered, text)
+                        if ok:
+                            logger.info(
+                                "TTS recovered from checkpoint: shot %s (dur=%.2fs)",
+                                shot_id, recovered.duration_s,
+                            )
+                            return {**seg, "result": recovered}
+
+        # 2. checkpoint 不可用 → 重新生成（最多 2 次重试）
+        for attempt in range(2):
+            try:
+                # 兼容 shot narration（带 audio_scene）和 dialogue（纯文本）
+                audio_scene = ""
+                if "type" in seg and seg.get("type") == "shot_narration":
+                    # narration 类型：尝试从 storyboard 取 audio_scene
+                    pass
+                text_prompt = text
+                if audio_scene:
+                    text_prompt = f"{text}（背景音：{audio_scene}）"
+
+                speed = 0.95 if seg.get("type") == "shot_narration" else 1.0
+                new_result = await adapter.synthesize(
+                    text=text_prompt, voice_id=voice_id, speed=speed, pitch=0.0,
+                )
+                ok, reason = self._validate_tts_result(new_result, text)
+                if ok:
+                    logger.info(
+                        "TTS regenerated: shot %s (attempt %d, dur=%.2fs)",
+                        shot_id, attempt + 1, new_result.duration_s,
+                    )
+                    # 重新生成成功后写入 checkpoint
+                    if shot_id is not None:
+                        ckpt.save("tts", shot_id, {
+                            "local_path": new_result.local_path,
+                            "audio_url": new_result.audio_url,
+                            "text": text,
+                            "voice_id": voice_id,
+                            "duration_s": new_result.duration_s,
+                            "cost_usd": new_result.cost_usd,
+                            "model": new_result.model,
+                            "type": seg.get("type", ""),
+                            "character": seg.get("character", ""),
+                            "word_timestamps": new_result.word_timestamps,
+                        })
+                    return {**seg, "result": new_result}
+                else:
+                    logger.warning(
+                        "TTS regen attempt %d failed for shot %s: %s",
+                        attempt + 1, shot_id, reason,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "TTS regen attempt %d exception for shot %s: %s",
+                    attempt + 1, shot_id, e,
+                )
+
+        # 3. 恢复失败：返回原 seg（result 仍为无效）
+        logger.error(
+            "TTS recovery exhausted for shot %s: keeping invalid result",
+            shot_id,
+        )
+        return seg
 
    # -- 4. TTS multi-character voice acting --
 

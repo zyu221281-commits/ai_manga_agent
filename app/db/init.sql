@@ -1,4 +1,4 @@
--- AI Manga Agent — 数据库初始化脚本
+-- AI Manga Agent V4 — 数据库初始化脚本
 -- 由 docker-compose 的 pg-init 服务执行（postgres healthy 后启动）
 -- 幂等设计：IF NOT EXISTS，可重复执行
 
@@ -65,9 +65,62 @@ CREATE INDEX IF NOT EXISTS idx_pending_reviews_episode ON pending_reviews(episod
 CREATE INDEX IF NOT EXISTS idx_pending_reviews_status  ON pending_reviews(status);
 
 -- ================================================================
+-- character_anchors: persistent character anchors for cross-episode consistency
+-- 由 SQLAlchemy ORM 自动 create_all；此处的 ALTER 用于已有部署升级
+-- ================================================================
+CREATE TABLE IF NOT EXISTS character_anchors (
+    id                  SERIAL PRIMARY KEY,
+    name                VARCHAR(200) UNIQUE NOT NULL,
+    role                VARCHAR(100) DEFAULT '',
+    seed_prompt         TEXT DEFAULT '',
+    seed_image_url      TEXT DEFAULT '',
+    seed_image_path     TEXT DEFAULT '',
+    seed                INTEGER DEFAULT 42,
+    traits_json         TEXT DEFAULT '[]',
+    generation_count    INTEGER DEFAULT 0,
+    -- 多视角 anchor（front / side / back）
+    front_image_path    TEXT DEFAULT '',
+    side_image_path     TEXT DEFAULT '',
+    back_image_path     TEXT DEFAULT '',
+    front_image_url     TEXT DEFAULT '',
+    side_image_url      TEXT DEFAULT '',
+    back_image_url      TEXT DEFAULT ''
+);
+
+-- 已有部署的兼容性迁移（IF NOT EXISTS 等价：DO 块检查列存在性）
+DO $$
+BEGIN
+    -- multi-view anchor fields
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='character_anchors' AND column_name='front_image_path') THEN
+        ALTER TABLE character_anchors ADD COLUMN front_image_path TEXT DEFAULT '';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='character_anchors' AND column_name='side_image_path') THEN
+        ALTER TABLE character_anchors ADD COLUMN side_image_path TEXT DEFAULT '';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='character_anchors' AND column_name='back_image_path') THEN
+        ALTER TABLE character_anchors ADD COLUMN back_image_path TEXT DEFAULT '';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='character_anchors' AND column_name='front_image_url') THEN
+        ALTER TABLE character_anchors ADD COLUMN front_image_url TEXT DEFAULT '';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='character_anchors' AND column_name='side_image_url') THEN
+        ALTER TABLE character_anchors ADD COLUMN side_image_url TEXT DEFAULT '';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='character_anchors' AND column_name='back_image_url') THEN
+        ALTER TABLE character_anchors ADD COLUMN back_image_url TEXT DEFAULT '';
+    END IF;
+END $$;
+
+-- ================================================================
 -- 验证
 -- ================================================================
 DO $$
 BEGIN
-    RAISE NOTICE 'AI Manga Agent schema initialized: cost_ledger, data_lineage, pending_reviews';
+    RAISE NOTICE 'AI Manga Agent V4 schema initialized: cost_ledger, data_lineage, pending_reviews, character_anchors (multi-view)';
 END $$;

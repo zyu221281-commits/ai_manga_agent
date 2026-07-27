@@ -1,9 +1,10 @@
-﻿"""60 集批量任务 + 幂等键 + 并行度=3
+"""系列批量任务 + 幂等键 + 并行度=3
 
- 韧性加固：
-- 60 集 → 60 个独立 Celery 链
+V4 韧性加固：
+- N 集 → N 个独立 Celery 链
 - episode_id 作为幂等键
 - 重投不重复执行
+- 总集数：默认从 settings.DEFAULT_TOTAL_EPISODES 读取（30），可在调用时覆盖
 """
 
 from __future__ import annotations
@@ -27,13 +28,18 @@ logger = logging.getLogger(__name__)
     default_retry_delay=300,
     name="app.tasks.series_batch_task.create_series_tasks",
 )
-def create_series_tasks(self, series_id: str, total_episodes: int = 60):
+def create_series_tasks(self, series_id: str, total_episodes: int = None):
     """为整个系列创建所有单集任务。
 
     Args:
         series_id: 系列 ID
-        total_episodes: 总集数（默认 60）
+        total_episodes: 总集数。None 时使用 settings.DEFAULT_TOTAL_EPISODES（默认 30）
     """
+    from app.core.config import settings
+    if total_episodes is None:
+        total_episodes = settings.DEFAULT_TOTAL_EPISODES
+    total_episodes = max(1, min(int(total_episodes), settings.MAX_TOTAL_EPISODES))
+
     splitter = TaskSplitter()
     plan = splitter.split(series_id, total_episodes)
 
@@ -108,9 +114,10 @@ def dispatch_episode_task(
 def get_series_progress(self, series_id: str) -> dict[str, Any]:
     """查询系列完成进度。"""
     # 在完整实现中从 PG episodes 表查询
+    from app.core.config import settings
     return {
         "series_id": series_id,
-        "total": 60,
+        "total": settings.DEFAULT_TOTAL_EPISODES,
         "completed": 0,
         "failed": 0,
         "running": 0,
