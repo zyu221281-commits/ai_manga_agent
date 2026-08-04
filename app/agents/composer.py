@@ -1,4 +1,4 @@
-"""Composer Agent - image, video, TTS, subtitles, BGM, cover generation and FFmpeg composition.
+"""Composer Agent - image, video, TTS,, BGM, cover generation and FFmpeg composition.
 
 Input: Writer output + AssetManager asset library.
 Output: EpisodeAsset (final video + subtitles + BGM + cover + AI content label).
@@ -22,9 +22,9 @@ from app.services.video_strategy import classify_scene, _extract_main_character,
 from app.services.episode_compositor import compose_episode
 
 from app.quality.character_consistency import character_consistency
-from app.quality.subtitle_generator import SubtitleGenerator
 from app.quality.content_gate import content_gate
 from app.quality.vqa_checker import vqa_checker
+from app.quality.video_content_checker import video_content_checker, VideoContentResult
 logger = logging.getLogger(__name__)
 
 
@@ -48,7 +48,7 @@ class ComposerAgent(BaseAgent):
     ) -> AgentResult:
         """Run the full production pipeline.
 
-        Returns EpisodeAsset with images, videos, audio, subtitles,
+        Returns EpisodeAsset with images, videos, audio,,
         BGM, covers, final video path, and AI content label metadata.
         """
         from app.agents.pipeline.context import PipelineContext
@@ -56,7 +56,7 @@ class ComposerAgent(BaseAgent):
 
         episode_id = self.episode_id or "ep_001"
 
-        # Build visual_specs from storyboard if not provided (degraded fallback)
+        # 若未传 visual_specs，尝试从 storyboard 构建
         if visual_specs is None:
             try:
                 from app.quality.visual_descriptor import visual_descriptor
@@ -95,7 +95,6 @@ class ComposerAgent(BaseAgent):
             "images": [self._image_to_dict(img) for img in context.image_results],
             "video_segments": [self._video_to_dict(v, i) for i, v in enumerate(context.video_segments)],
             "audio_segments": [self._tts_to_dict(a["result"]) for a in context.audio_segments if a["result"]],
-            "subtitles": context.subtitles,
             "bgm_track": "",
             "covers": context.covers,
             "final_video_path": context.compose_result.get("final_video_path", ""),
@@ -376,7 +375,7 @@ class ComposerAgent(BaseAgent):
 
         negative = prompt_data.get("negative_prompt", "")
 
-        # Select best-view ref_image by shot_angle
+        # 按 shot_angle 选最佳视角 ref_image
         # 若 cs 中已带 visual_spec，则用 PromptTemplateEngine 重新渲染 prompt（确定性输出）
         visual_spec = cs.get("visual_spec")
         if visual_spec:
@@ -594,12 +593,37 @@ class ComposerAgent(BaseAgent):
                         duration_s=duration, motion_type=motion, prompt_text=prompt_text,
                     )
                     if result.local_path:
-                        result.scene_type = scene_type
-                        ckpt.save("video", shot_id, {
-                            "local_path": result.local_path, "url": result.url,
-                            "duration_s": result.duration_s, "model": result.model,
-                        })
-                        return result
+                        ok, reason = self._validate_video_result(result, shot_id)
+                        if not ok:
+                            logger.warning("Video L0 file invalid (shot %d): %s", shot_id, reason)
+                            try:
+                                os.remove(result.local_path)
+                            except Exception:
+                                pass
+                        else:
+                            # 文件校验通过，执行内容质检
+                            content_ok, content_detail = await self._check_video_content(
+                                video_path=result.local_path,
+                                source_image_path=image_path,
+                                scene_type=scene_type,
+                                character_name=cs.get("character_name", ""),
+                            )
+                            if not content_ok:
+                                logger.warning(
+                                    "Video L0 content check failed (shot %d): %s",
+                                    shot_id, content_detail,
+                                )
+                                try:
+                                    os.remove(result.local_path)
+                                except Exception:
+                                    pass
+                            else:
+                                result.scene_type = scene_type
+                                ckpt.save("video", shot_id, {
+                                    "local_path": result.local_path, "url": result.url,
+                                    "duration_s": result.duration_s, "model": result.model,
+                                })
+                                return result
                 except Exception as e:
                     logger.warning("Video L0 failed (shot %d): %s", shot_id, e)
 
@@ -616,6 +640,31 @@ class ComposerAgent(BaseAgent):
                                 motion_type=alt_motion, prompt_text=prompt_text,
                             )
                             if result.local_path:
+                                ok, reason = self._validate_video_result(result, shot_id)
+                                if not ok:
+                                    logger.warning("Video L1 file invalid (shot %d, motion=%s): %s", shot_id, alt_motion, reason)
+                                    try:
+                                        os.remove(result.local_path)
+                                    except Exception:
+                                        pass
+                                    continue
+                                # 文件校验通过，执行内容质检
+                                content_ok, content_detail = await self._check_video_content(
+                                    video_path=result.local_path,
+                                    source_image_path=image_path,
+                                    scene_type=scene_type,
+                                    character_name=cs.get("character_name", ""),
+                                )
+                                if not content_ok:
+                                    logger.warning(
+                                        "Video L1 content check failed (shot %d, motion=%s): %s",
+                                        shot_id, alt_motion, content_detail,
+                                    )
+                                    try:
+                                        os.remove(result.local_path)
+                                    except Exception:
+                                        pass
+                                    continue
                                 result.scene_type = scene_type
                                 ckpt.save("video", shot_id, {
                                     "local_path": result.local_path, "url": result.url,
@@ -638,13 +687,38 @@ class ComposerAgent(BaseAgent):
                             motion_type="zoom-in", prompt_text=prompt_text,
                         )
                         if result.local_path:
-                            result.scene_type = scene_type
-                            result.metadata = {**result.metadata, "fallback": "seedance_retry"}
-                            ckpt.save("video", shot_id, {
-                                "local_path": result.local_path, "url": result.url,
-                                "duration_s": result.duration_s, "model": result.model,
-                            })
-                            return result
+                            ok, reason = self._validate_video_result(result, shot_id)
+                            if not ok:
+                                logger.warning("Video L2 file invalid (shot %d): %s", shot_id, reason)
+                                try:
+                                    os.remove(result.local_path)
+                                except Exception:
+                                    pass
+                            else:
+                                # 文件校验通过，执行内容质检
+                                content_ok, content_detail = await self._check_video_content(
+                                    video_path=result.local_path,
+                                    source_image_path=image_path,
+                                    scene_type=scene_type,
+                                    character_name=cs.get("character_name", ""),
+                                )
+                                if not content_ok:
+                                    logger.warning(
+                                        "Video L2 content check failed (shot %d): %s",
+                                        shot_id, content_detail,
+                                    )
+                                    try:
+                                        os.remove(result.local_path)
+                                    except Exception:
+                                        pass
+                                else:
+                                    result.scene_type = scene_type
+                                    result.metadata = {**result.metadata, "fallback": "seedance_retry"}
+                                    ckpt.save("video", shot_id, {
+                                        "local_path": result.local_path, "url": result.url,
+                                        "duration_s": result.duration_s, "model": result.model,
+                                    })
+                                    return result
                     except Exception as e:
                         logger.error("Video L2 Seedance retry failed (shot %d): %s", shot_id, e)
 
@@ -678,7 +752,7 @@ class ComposerAgent(BaseAgent):
             "cinematic lighting",
             scene_data.get("emotion", ""),
         ]
-        # Inject canonical appearance for cross-episode consistency
+        # 注入角色 canonical appearance 到视频 prompt
         # 三视图 anchor 在每集启动时从 DB 加载（episode_task._load_character_anchors），
         # 此处取 anchor.seed_prompt（首集 id_card 原文构建，跨集唯一基准），
         # 确保视频模型在动画过程中保持角色外观，防止 25 集间 drift。
@@ -705,6 +779,34 @@ class ComposerAgent(BaseAgent):
         if not char_name:
             return ""
         return f"{char_name}, consistent character appearance, same person throughout"
+
+    async def _check_video_content(
+        self,
+        video_path: str,
+        source_image_path: str,
+        scene_type: str,
+        character_name: str = "",
+    ) -> tuple[bool, str]:
+        """检查视频内容质量，不通过则触发重试。
+
+        1. 抽帧 + CLIP 相似度 vs 源图（所有视频）
+        2. VLM 人物完整性检查（仅 KEY_SCENE）
+
+        Returns:
+            (passed, detail): passed=True 表示内容合格可进入合成
+        """
+        if not settings.VIDEO_CONTENT_CHECK_ENABLED:
+            return True, "content check disabled"
+
+        result: VideoContentResult = await video_content_checker.check_video(
+            video_path=video_path,
+            source_image_path=source_image_path,
+            scene_type=scene_type,
+            character_name=character_name,
+        )
+        if result.passed:
+            return True, result.detail
+        return False, result.detail
 
     # ================================================================
     # TTS 校验 + Checkpoint 恢复（音画对齐前置约束）
@@ -735,6 +837,42 @@ class ComposerAgent(BaseAgent):
             ratio = dur / expected_dur if expected_dur > 0 else 1.0
             if ratio < 0.33 or ratio > 3.0:
                 return False, f"duration ratio out of range: {ratio:.2f} (dur={dur:.2f}s, expected={expected_dur:.2f}s)"
+        return True, ""
+
+    @staticmethod
+    def _validate_video_result(result, shot_id: int) -> tuple[bool, str]:
+        """校验视频生成结果的基本有效性。
+
+        Returns:
+            (is_valid, reason): is_valid=True 时 reason 为空；False 时 reason 说明失败原因
+        """
+        if result is None:
+            return False, "result is None"
+        if not getattr(result, "local_path", ""):
+            return False, "local_path empty"
+        local_path = result.local_path
+        if not os.path.isfile(local_path):
+            return False, f"file not found: {local_path}"
+        file_size = os.path.getsize(local_path)
+        if file_size < 10240:
+            return False, f"file too small: {file_size} bytes"
+        if not local_path.lower().endswith(".mp4"):
+            return False, f"not an mp4 file: {local_path}"
+        # ffprobe 验证文件是否为有效视频
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", local_path],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode != 0:
+                return False, f"ffprobe failed: {r.stderr[:200]}"
+            dur = float(r.stdout.strip() or "0")
+            if dur < 0.5:
+                return False, f"duration too short: {dur:.2f}s"
+        except Exception as e:
+            return False, f"ffprobe exception: {e}"
         return True, ""
 
     async def _recover_tts_segment(
@@ -857,7 +995,6 @@ class ComposerAgent(BaseAgent):
         scenes = script.get("scenes", [])
         char_voice_map = self._build_voice_map(asset_library)
         audio_segments: list[dict] = []
-        subtitle_entries: list[dict] = []
         narrator_voice = "zh_male_ruyayichen_uranus_bigtts"
         shot_sub_time: dict[int, int] = {}
 
@@ -941,207 +1078,7 @@ class ComposerAgent(BaseAgent):
                 return shots[idx]
             return None  # no more shots in this scene
 
-        def _assign_subtitle_timing(
-            shot_id: int | None, text: str, speaker: str, scene_idx: int,
-            subs: list[str], tts_dur_ms: int,
-        ) -> None:
-            """Assign shot-relative start_ms/end_ms to subtitle entries based on TTS duration.
-
-            start_ms/end_ms are relative to the SHOT's start time (0 = shot start).
-            The compositor will offset them by the shot's absolute start in the final video.
-            Duration is distributed proportionally to each subtitle's character count.
-            """
-            cum_ms = shot_sub_time.get(shot_id, 0)
-            total_chars = sum(len(s) for s in subs) or 1
-            for entry_text in subs:
-                entry_dur_ms = max(int(tts_dur_ms * len(entry_text) / total_chars), 500)
-                subtitle_entries.append({
-                    "text": entry_text, "speaker": speaker,
-                    "scene_index": scene_idx,
-                    "shot_id": shot_id,
-                    "start_ms": cum_ms,
-                    "end_ms": cum_ms + entry_dur_ms,
-                })
-                cum_ms += entry_dur_ms
-            shot_sub_time[shot_id] = cum_ms
-
-        for scene_idx, scene in enumerate(scenes):
-            scene_id = scene.get("scene_id", scene_idx + 1)
-
-            # NOTE: Scene-level narration TTS is intentionally SKIPPED here.
-            # The writer already splits scene narration into per-shot narration
-            # fields (shot.narration), which are handled in stage 3 below.
-            # Generating scene-level narration would:
-            #   1. Duplicate content already covered by shot narrations
-            #   2. Assign a long audio (e.g. 19s) to a single short shot (e.g. 8s),
-            #      causing severe audio-visual desync
-            # Scene narration is only used as fallback for shots with empty
-            # narration (handled in stage 3).
-
-            # 1) Dialogue TTS — assigned to shots WITHIN the same scene
-            for d in scene.get("dialogue", []):
-                if isinstance(d, dict):
-                    character = d.get("character", "")
-                    line = d.get("line", "")
-                elif isinstance(d, str):
-                    character = ""
-                    line = d
-                else:
-                    continue
-                if not line:
-                    continue
-                # 优先用 voice_map；未匹配的角色默认用男声（适合侦探/旁白类）
-                voice_id = char_voice_map.get(character, "zh_male_ruyayichen_uranus_bigtts")
-                shot_id = _next_shot_in_scene(scene_id) if storyboard else None
-                tts_result = None
-
-                # Checkpoint 恢复：优先从 tts.json 加载，避免重复调用 API
-                saved = _try_load_ckpt(shot_id, "dialogue")
-                if saved and saved.get("type") == "dialogue":
-                    seg = _restore_from_ckpt(saved, shot_id, scene_idx)
-                    audio_segments.append(seg)
-                    tts_result = seg["result"]
-                    logger.info("TTS checkpoint hit: shot %d dialogue skipped", shot_id)
-                else:
-                    try:
-                        tts_result = await adapter.synthesize(
-                            text=line, voice_id=voice_id, speed=1.0, pitch=0.0,
-                        )
-                        audio_segments.append({
-                            "result": tts_result,
-                            "scene_index": scene_idx,
-                            "scene_id": scene_id,
-                            "shot_id": shot_id,
-                            "type": "dialogue",
-                            "character": character,
-                            "text": line,
-                        })
-                        _save_ckpt(shot_id, tts_result, line, voice_id,
-                                   "dialogue", character, scene_id, scene_idx)
-                    except Exception as e:
-                        logger.error("TTS failed for '%s': %s", line[:30], e)
-                        audio_segments.append({
-                            "result": None, "scene_index": scene_idx, "scene_id": scene_id,
-                            "shot_id": None, "type": "dialogue",
-                        })
-
-                # Assign shot-relative timing to subtitles based on TTS duration
-                tts_dur_ms = int((tts_result.duration_s if tts_result else 0) * 1000)
-                _assign_subtitle_timing(
-                    shot_id, line, character, scene_idx,
-                    self._split_text_for_subtitles(line), tts_dur_ms,
-                )
-
-        # 3. Shot-level narration: 补全未分配 TTS 的 shot（保证 100% 音频覆盖）
-        # Writer 为无 dialogue 的 shot 写了 narration 字段（语音叙事，非画面描述）
-        if storyboard:
-            assigned_shots = {a.get("shot_id") for a in audio_segments if a.get("shot_id") is not None}
-            # Build scene_id → scene narration mapping for fallback (stage 3b)
-            scene_narration_map: dict[int, str] = {}
-            for scene in scenes:
-                sid = scene.get("scene_id", 0)
-                narr = (scene.get("narration") or "").strip()
-                if narr:
-                    scene_narration_map[sid] = narr
-
-            # Pre-compute uncovered sentences per scene:
-            # scene_id → list of sentences NOT already covered by any shot's narration
-            scene_uncovered: dict[int, list[str]] = {}
-            for scene in scenes:
-                sid = scene.get("scene_id", 0)
-                scene_narr = (scene.get("narration") or "").strip()
-                if not scene_narr:
-                    continue
-                all_sentences = [s.strip() for s in scene_narr.replace("。", "。\n").split("\n") if s.strip()]
-                # Collect narration text from shots that have non-empty narration in this scene
-                used_text = ""
-                for s in storyboard:
-                    if s.get("scene_id") == sid:
-                        used_text += (s.get("narration") or "").strip()
-                # Filter: keep sentences NOT already covered by shot narrations
-                uncovered = [sent for sent in all_sentences if sent not in used_text]
-                scene_uncovered[sid] = uncovered
-
-            for shot in storyboard:
-                shot_id = shot.get("shot_id")
-                if shot_id is None or shot_id in assigned_shots:
-                    continue
-                narration = (shot.get("narration") or "").strip()
-                scene_id = shot.get("scene_id", 0)
-                shot_idx = max(shot_id - 1, 0)
-
-                # 3b. Fallback: shot with empty narration → use UNCOVERED scene narration
-                if not narration:
-                    uncovered = scene_uncovered.get(scene_id, [])
-                    if not uncovered:
-                        continue  # scene narration fully covered by other shots → silent
-                    # Count empty-narration shots in this scene to distribute evenly
-                    empty_shots_in_scene = [
-                        s.get("shot_id") for s in storyboard
-                        if s.get("scene_id") == scene_id
-                        and s.get("shot_id") not in assigned_shots
-                        and not (s.get("narration") or "").strip()
-                    ]
-                    my_idx = empty_shots_in_scene.index(shot_id) if shot_id in empty_shots_in_scene else 0
-                    total = len(empty_shots_in_scene) or 1
-                    # Distribute uncovered sentences: each empty shot gets ~1/total
-                    per_shot = max(len(uncovered) // total, 1)
-                    start = min(my_idx * per_shot, len(uncovered))
-                    end = min(start + per_shot, len(uncovered))
-                    narration = "".join(uncovered[start:end]) if uncovered[start:end] else ""
-                    if not narration:
-                        continue
-                    logger.debug(
-                        "Shot %d: empty narration, using scene %d uncovered fallback (portion %d/%d, %d sentences)",
-                        shot_id, scene_id, my_idx + 1, total, end - start,
-                    )
-
-                tts_result = None
-
-                # Checkpoint 恢复：优先从 tts.json 加载 narration
-                saved = _try_load_ckpt(shot_id, "narration")
-                if saved and saved.get("type") == "shot_narration":
-                    seg = _restore_from_ckpt(saved, shot_id, shot_idx)
-                    audio_segments.append(seg)
-                    tts_result = seg["result"]
-                    logger.info("TTS checkpoint hit: shot %d narration skipped", shot_id)
-                else:
-                    try:
-                        # 将 audio_scene 组合到 text_prompt，让 Seed Audio 生成包含背景音的完整音频场景
-                        # audio_scene 描述环境声/BGM/情绪氛围，narration 是要被"说出来"的文本
-                        audio_scene = (shot.get("audio_scene") or "").strip()
-                        text_prompt = narration
-                        if audio_scene:
-                            text_prompt = f"{narration}（背景音：{audio_scene}）"
-                        tts_result = await adapter.synthesize(
-                            text=text_prompt, voice_id=narrator_voice, speed=0.95, pitch=0.0,
-                        )
-                        audio_segments.append({
-                            "result": tts_result,
-                            "scene_index": shot_idx,
-                            "scene_id": scene_id,
-                            "shot_id": shot_id,
-                            "type": "shot_narration",
-                            "text": narration,  # 字幕用纯 narration（不含 audio_scene 描述）
-                            "character": "narrator",
-                        })
-                        _save_ckpt(shot_id, tts_result, narration, narrator_voice,
-                                   "shot_narration", "narrator", scene_id, shot_idx)
-                        tts_dur_ms = int((tts_result.duration_s if tts_result else 0) * 1000)
-                        _assign_subtitle_timing(
-                            shot_id, narration, "narrator", shot_idx,
-                            self._split_text_for_subtitles(narration), tts_dur_ms,
-                        )
-                        logger.debug("Shot narration audio for shot %d: %s", shot_id, narration[:30])
-                    except Exception as e:
-                        logger.error("Shot narration TTS failed (shot %d): %s", shot_id, e)
-                        audio_segments.append({
-                            "result": None, "scene_index": shot_idx, "scene_id": scene_id,
-                            "shot_id": shot_id, "type": "shot_narration",
-                        })
-
-        return audio_segments, subtitle_entries
-
+    
     def _build_voice_map(self, asset_library: dict) -> dict[str, str]:
         from app.resilience.adapters.tts_adapter import DEFAULT_MALE_SPEAKER
         voice_map: dict[str, str] = {}
@@ -1166,14 +1103,6 @@ class ComposerAgent(BaseAgent):
             else:
                 voice_map[name] = "zh_female_qingxin"
         return voice_map
-
-    @staticmethod
-    def _split_text_for_subtitles(text: str, max_chars: int = 20) -> list[str]:
-        """Split text at punctuation boundaries for subtitle display.
-
-        Delegates to the canonical SubtitleGenerator._split_text implementation.
-        """
-        return SubtitleGenerator._split_text(text, max_chars)
 
     # -- 5. BGM selection 已移除 --
     # Seed Audio 1.0 在生成对白时同步产出背景音效与 BGM 元素，
@@ -1201,7 +1130,6 @@ class ComposerAgent(BaseAgent):
         self,
         video_segments: list[VideoResult],
         audio_segments: list[dict],
-        subtitles: list[dict],
         bgm_track: str,
         classified_scenes: list[dict],
         episode_id: str,

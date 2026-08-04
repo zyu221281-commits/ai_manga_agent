@@ -1,4 +1,4 @@
-﻿"""Checkpoint Manager — 断点续传基础设施。
+"""Checkpoint Manager — 断点续传基础设施。
 
 每生成 1 个资源（图片/视频/TTS）成功后立即写入 checkpoint。
 当管道崩溃或部分失败时，可从 checkpoint 恢复已生成的资源，避免重复生成。
@@ -60,10 +60,24 @@ class CheckpointManager:
             return {}
 
     def _write(self, stage: str, data: dict[str, Any]) -> None:
-        """写入某阶段的 checkpoint 文件。"""
+        """写入某阶段的 checkpoint 文件（原子写入）。"""
+        import tempfile
         p = self._path(stage)
         try:
-            p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                suffix=".json", prefix=f"{stage}_", dir=str(self._dir),
+            )
+            try:
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, p)  # 原子重命名（Windows/Linux 均支持）
+            except Exception:
+                os.replace(tmp_path, p) if os.path.exists(tmp_path) else None
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+                raise
         except Exception as e:
             logger.warning("Checkpoint write failed (%s/%s): %s", self.episode_id, stage, e)
 

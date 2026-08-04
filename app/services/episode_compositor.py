@@ -1,4 +1,4 @@
-﻿"""Episode Compositor — FFmpeg final composition.
+"""Episode Compositor — FFmpeg final composition.
 
 Takes per-scene video segments + per-scene audio (Seed Audio 1.0 输出，
 已整合对白 + BGM + 音效) and produces a single final MP4 with:
@@ -370,8 +370,8 @@ def _concatenate_clips(clip_paths: list[str], output_path: str, clip_durations=N
         logger.info("Concat %d clips (demuxer) -> %s (%.1fs, %.1f MB)",
                     n, output_path, actual_dur, size)
         if actual_dur < sum(durations) * 0.7:
-            logger.warning("Concat output too short (%.1fs < %.1fs*0.7)",
-                           actual_dur, sum(durations))
+            logger.error("Concat output duration anomaly: %.1fs < expected %.1fs (%.0f%% loss)",
+                         actual_dur, sum(durations), (1 - actual_dur / max(sum(durations), 0.1)) * 100)
         return True
 
     logger.error("Concat demuxer failed: %s", err[:300])
@@ -518,9 +518,43 @@ def _combine_scene_video_audio(
     return False, out_dur
 
 
+def _validate_final_video(path: str) -> tuple[bool, str]:
+    """Validate final composed video: exists, playable, has video stream, duration > 0.
+
+    Returns:
+        (is_valid, reason): True + empty reason on success, False + error detail otherwise.
+    """
+    if not path or not os.path.isfile(path):
+        return False, f"file not found: {path}"
+    file_size = os.path.getsize(path)
+    if file_size < 10240:
+        return False, f"file too small: {file_size} bytes"
+    try:
+        import subprocess
+        # Check for video stream
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=15,
+        )
+        if "video" not in r.stdout:
+            return False, "no video stream detected"
+        # Check duration
+        r2 = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=15,
+        )
+        dur = float(r2.stdout.strip() or "0")
+        if dur < 0.5:
+            return False, f"duration too short: {dur:.2f}s"
+        return True, ""
+    except Exception as e:
+        return False, f"ffprobe health check exception: {e}"
+
+
 async def compose_episode(
     scene_groups: list[dict],
-    subtitles: list[dict],
     episode_id: str = "ep_001",
     output_dir: Optional[str] = None,
     bgm_path: str = "",
@@ -570,7 +604,7 @@ async def compose_episode(
 
     logger.info(
         "Composing episode %s (scene-level): %d scenes, %d subtitles",
-        episode_id, len(valid_scenes), len(subtitles),
+        episode_id, len(valid_scenes),
     )
 
     scene_clips: list[str] = []
@@ -589,7 +623,13 @@ async def compose_episode(
             video_paths = [v["local_path"] for v in videos]
             ok = _concatenate_clips(video_paths, scene_video)
             if not ok or not os.path.isfile(scene_video):
-                logger.warning("Scene %d video concat failed, using first shot", si)
+                logger.error(
+                    "Scene %d video concat failed (%d shots → fallback to first shot %s), "
+                    "shots %d..%d content lost",
+                    si, len(videos), videos[0].get("shot_id", "?"),
+                    videos[1].get("shot_id", 0) if len(videos) > 1 else 0,
+                    videos[-1].get("shot_id", 0) if len(videos) > 1 else 0,
+                )
                 scene_video = videos[0]["local_path"]
 
         # Step 2: Build scene audio — concat all TTS audios in this scene (in shot order)
@@ -603,7 +643,10 @@ async def compose_episode(
             scene_clips.append(clip_path)
             scene_durations.append(actual_dur)
         else:
-            logger.warning("Scene %d combine failed, using raw video", si)
+            logger.error(
+                "Scene %d combine failed (video=%s, audio=%s), using raw video without audio",
+                si, scene_video, scene_audio or "none",
+            )
             scene_clips.append(scene_video)
             d = _probe_video_duration(scene_video)
             scene_durations.append(d if d > 0.5 else 5.0)
@@ -653,6 +696,19 @@ async def compose_episode(
     if os.path.isfile(final_path):
         size_mb = os.path.getsize(final_path) / (1024 * 1024)
         total_dur = sum(scene_durations)
+
+        # Final video health check: verify playability before declaring success
+        health_ok, health_err = _validate_final_video(final_path)
+        if not health_ok:
+            logger.error("Final video health check failed: %s", health_err)
+            return {
+                "final_video_path": final_path,
+                "success": False,
+                "error": f"health check failed: {health_err}",
+                "duration_s": total_dur,
+                "size_mb": round(size_mb, 1),
+            }
+
         logger.info(
             "Episode composed (scene-level): %s (%.1f MB, ~%.0fs)",
             final_path, size_mb, total_dur,
@@ -670,7 +726,6 @@ async def compose_episode(
 
 def compose_episode_sync(
     scene_groups: list[dict],
-    subtitles: list[dict],
     episode_id: str = "ep_001",
     output_dir: Optional[str] = None,
     bgm_path: str = "",

@@ -44,12 +44,12 @@ class Settings(BaseSettings):
     COST_ALERT_THRESHOLD: float = 0.8
     COST_HARD_STOP_THRESHOLD: float = 1.0
 
-    # === 视频分级策略（V4 参数化）===
+    # === 视频分级策略 ===
     VIDEO_KEY_SCENE_RATIO: float = 0.20
     VIDEO_KEY_SCENE_MODEL: str = "volcengine-video"
     VIDEO_AB_TEST_ENABLED: bool = True
 
-    # === Critic 质量门（V4 可配置阈值）===
+    # === Critic 质量门 ===
     CRITIC_PASS_THRESHOLD: float = 0.8
     CRITIC_REVIEW_THRESHOLD: float = 0.6
     CRITIC_MAX_RETRY: int = 2
@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     # 集中管理所有媒体生成的单价，避免分散硬编码
     IMAGE_COST_PER_UNIT: float = 0.02       # 每张图片（Seedream 5.0 Pro）
     VIDEO_COST_PER_SECOND: float = 0.30     # 视频每秒（Seedance）
+    VIDEO_POLL_MAX_WAIT_S: int = 600          # Seedance 任务轮询最大等待秒数
     TTS_COST_PER_CHAR: float = 0.000016     # TTS 每字符（seed-tts-2.0）
 
     # === 风格封印（锁定创作参数，防止 Agent 随机创新）===
@@ -94,6 +95,11 @@ class Settings(BaseSettings):
     VQA_ENABLED: bool = True
     VQA_MODEL: str = "qwen-vl-max"           # 多模态 LLM 模型
     VQA_MAX_IMAGES: int = 5                  # 单集最多检查的 KEY_SCENE 数量（成本控制）
+
+    # === 视频内容质检 ===
+    VIDEO_CONTENT_CHECK_ENABLED: bool = True
+    VIDEO_CONTENT_CHECK_CLIP_THRESHOLD: float = 0.72  # 视频帧与源图 CLIP 相似度阈值
+    VIDEO_CONTENT_CHECK_VLM_ENABLED: bool = True       # KEY_SCENE VLM 人物完整性检查
 
     # === API Keys（从 .env 读取，Demo 阶段可为空）===
     DEEPSEEK_API_KEY: str = ""

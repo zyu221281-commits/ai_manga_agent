@@ -22,6 +22,8 @@
 - **跨集角色锚点持久化**：首集生成三视图 + canonical appearance 写入 DB，后续集自动加载复用
 - **音画对齐硬约束**：TTS 6 项质量校验 + 视频生成严格使用 TTS 真实时长，杜绝音画不同步
 - **剧集数可配置**：用户输入指定集数，不输入默认 30 集（上限 200 集保护）
+- **视频内容质检**：Seedance 图生视频后阻断式质检（抽帧 + CLIP 相似度 + VLM 人物完整性），拦截肢体断裂/面部扭曲/外观漂移
+- **视频全链路加固**：下载校验 + ffprobe 文件验证 + 三层重试（L0/L1/L2）+ 最终视频健康检查 + 原子化 checkpoint
 
 ## 🏗️ 技术架构
 
@@ -116,9 +118,6 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```bash
 # 单集完整管线测试
 python scripts/run_one_episode.py
-
-# 完整系列生成
-python scripts/run_full_pipeline.py --series "s_xianxia_001" --episodes 5
 ```
 
 ## 📡 API 文档
@@ -278,7 +277,7 @@ sequenceDiagram
 - **恢复机制**：校验失败时优先从 checkpoint 恢复，否则重新生成（最多 2 次）
 - **硬约束**：无 TTS 时长的 shot 直接跳过视频生成（不使用 storyboard 估算 fallback）
 
-### VQA Checker（生成后）
+### VQA Checker（图像生成后）
 
 | 检测项 | 说明 |
 |--------|------|
@@ -287,6 +286,27 @@ sequenceDiagram
 | impossible_physics | 物理异常 |
 | watermark | 水印检测 |
 | facial_distortion | 面部扭曲 |
+
+### VideoContentChecker（视频生成后阻断式）
+
+Seedance 图生视频后立即质检，不通过则删除文件并触发下一层重试，防止问题视频进入最终合成。
+
+- **抽帧**：ffmpeg 在视频 30% / 50% / 70% 位置抽取 3 帧
+- **CLIP 相似度**：每帧与源图计算余弦相似度，阈值默认 0.72（`VIDEO_CONTENT_CHECK_CLIP_THRESHOLD`）
+- **VLM 人物完整性**：仅 KEY_SCENE，qwen-vl-max 检查肢体完整性 / 面部扭曲 / 外观漂移 / 运动伪影
+- **阻断式设计**：任一不通过 → `passed=False` → 删文件 → 进入下一层重试（L0→L1→L2→跳过）
+- **降级策略**：模型/API 不可用时返回 `passed=True`，不阻断生产
+
+### 视频全链路加固
+
+| 环节 | 校验内容 |
+|------|----------|
+| 下载后 | 内容 < 10KB 拒绝 + ffprobe 验证可播放且时长 > 0.5s |
+| 重试层 | 文件存在 / 大小 > 10KB / 扩展名 .mp4 / ffprobe 可解码 |
+| 合成阶段 | concat/combine 失败升级为 error 日志，时长 < 预期 70% 升级为 error |
+| 最终视频 | ffprobe 验证视频流存在 + 格式可解析 + 时长 > 0.5s |
+| Checkpoint | `tempfile.mkstemp` + `os.replace()` 原子写入，写入中断不损坏已有数据 |
+| Seedance 轮询 | 自适应间隔（5s→5s→10s→10s→15s）+ 可配置超时 `VIDEO_POLL_MAX_WAIT_S` |
 
 ### Critic 分级路由
 
@@ -350,8 +370,111 @@ quality_gate_pass_rate{tier="T0"}
 - **断点续传**：崩溃后从失败点继续，节省大量重新生成成本
 - **成本可观测**：实时追踪、预算告警、硬止损三重保障
 - **音画对齐硬约束**：TTS 6 项质量校验 + 视频严格使用 TTS 真实时长
+- **视频内容质检**：Seedance 图生视频后立即质检（抽帧 + CLIP + VLM），拦截肢体断裂/面部扭曲/外观漂移
+- **视频全链路加固**：下载校验 + ffprobe 验证 + 三层重试 + 最终健康检查 + 原子化 checkpoint
 
 ## 📝 更新日志
+
+### v3.0.0 — 视频生成链路生产环境修复
+
+针对视频生成 → 质检 → 合成全链路在生产环境暴露的 7 类问题进行修复，新增 1 个文件，修改 6 个文件。
+
+#### 1. 视频下载后无文件校验
+
+`video_adapter.py` 的 `_download()` 下载视频后直接使用，不验证文件有效性。API 返回错误页面（200 OK 但内容是 HTML）或下载不完整的文件会直接进入后续流程。
+
+- 下载后检查内容大小，< 10KB 直接拒绝
+- 新增 `_validate_video_file()` 静态方法，用 ffprobe 验证文件可播放且时长 > 0.5s
+- 校验失败返回空字符串，触发调用方的重试逻辑
+
+#### 2. Composer 视频结果校验不足
+
+`composer.py` 的 `_generate_videos()` 在每个重试层成功后只判断 `local_path` 是否为真值，不验证文件是否真实存在、大小是否合理。
+
+- 新增 `_validate_video_result()` 静态方法：文件存在 / 大小 > 10KB / 扩展名 .mp4 / ffprobe 可解码
+- 在 L0/L1/L2 每个重试成功后调用，不通过则删除文件并继续下一层重试
+
+#### 3. 合成阶段静默降级
+
+`episode_compositor.py` 中拼接失败时静默降级为第一个 shot 的视频（整场内容丢失），combine 失败时静默降级为无音频视频，时长异常只打 warning。
+
+- concat/combine 失败日志从 warning 升为 error，记录丢失的 shot 范围与具体文件路径
+- 输出时长短于预期的 70% 时升级为 error，记录损失百分比
+
+#### 4. Checkpoint 非原子写入
+
+`checkpoint_manager.py` 的 `_write()` 直接覆盖写 JSON 文件，并发场景下可能因写入中断导致 checkpoint 损坏。
+
+- 改为 `tempfile.mkstemp` + `os.replace()` 原子重命名模式
+- 先写临时文件，成功后原子替换目标文件，写入中断不会损坏已有数据
+
+#### 5. 最终视频无健康检查
+
+`compose_episode()` 在最终视频生成后只检查文件是否存在，不验证视频是否可播放。
+
+- 新增 `_validate_final_video()`：ffprobe 验证视频流存在 / 格式可解析 / 时长 > 0.5s
+- 健康检查不通过返回 `success=False` + 具体错误信息
+
+#### 6. Seedance 轮询优化
+
+`video_adapter.py` 中 Seedance 任务轮询固定 15s 间隔、10 分钟超时硬编码、无任务取消机制。
+
+- 自适应轮询间隔：5s → 5s → 10s → 10s → 15s（先快后慢）
+- 超时改为可配置 `VIDEO_POLL_MAX_WAIT_S`（默认 600s）
+- 单次 poll 异常不退出循环，继续重试
+
+#### 7. 视频内容质量缺失（核心）
+
+图像生成后有 ContentGate（CLIP 风格检查）和 VQA（物理异常检查），但视频生成后完全无内容质检。Seedance 图生视频可能产生人物肢体断裂/缺失、面部扭曲、外观漂移、运动伪影等问题，有问题的视频直接进入最终合成。
+
+- 新增 [`app/quality/video_content_checker.py`](app/quality/video_content_checker.py) — `VideoContentChecker` 视频内容质检器
+- 抽帧：ffmpeg 在视频 30% / 50% / 70% 位置抽取 3 帧
+- CLIP 相似度：每帧与源图计算余弦相似度，阈值默认 0.72
+- VLM 人物完整性：仅 KEY_SCENE，qwen-vl-max 检查肢体完整性 / 面部扭曲 / 外观漂移 / 伪影
+- 任一不通过 → 删除视频文件 → 继续下一层重试
+- 模型/API 不可用时降级为通过，不阻断生产
+- `composer.py` 在 L0/L1/L2 每个重试层中，文件校验通过后执行内容质检
+- 新增配置项：`VIDEO_CONTENT_CHECK_ENABLED` / `VIDEO_CONTENT_CHECK_CLIP_THRESHOLD` / `VIDEO_CONTENT_CHECK_VLM_ENABLED`
+
+#### 视频生成新流程
+
+```
+L0: Seedance 生成
+  → 文件校验（存在/大小/ffprobe）     ← #1 #2
+  → 内容质检（抽帧+CLIP+VLM）         ← #7
+  → ✔ 通过 → 保存 checkpoint         ← #4（原子写入）
+  → ✘ 不通过 → 删文件, 进入 L1
+
+L1: 换 motion 重试
+  → 文件校验                          ← #2
+  → 内容质检                          ← #7
+  → ✔ 通过 → 保存 checkpoint
+  → ✘ 不通过 → 删文件, 进入 L2
+
+L2: Seedance 重试
+  → 文件校验                          ← #2
+  → 内容质检                          ← #7
+  → ✔ 通过 → 保存 checkpoint
+  → ✘ 不通过 → 跳过该 shot
+
+最终合成
+  → 降级日志（error 级别）            ← #3
+  → 健康检查（视频流+可播放性）        ← #5
+```
+
+#### 涉及文件
+
+| 文件 | 操作 |
+|------|------|
+| `app/resilience/adapters/video_adapter.py` | 修改 #1 #6 |
+| `app/agents/composer.py` | 修改 #2 #7 |
+| `app/services/episode_compositor.py` | 修改 #3 #5 |
+| `app/services/checkpoint_manager.py` | 修改 #4 |
+| `app/core/config.py` | 修改 #6 #7 |
+| `app/quality/video_content_checker.py` | 新建 #7 |
+| `.env.example` | 更新 |
+
+---
 
 ### v2.0.0 — 角色一致性 + 音画对齐深度优化
 
@@ -402,9 +525,7 @@ quality_gate_pass_rate{tier="T0"}
 
 #### 测试
 
-新增 2 个功能测试脚本：
-- [`scripts/test_cross_episode_consistency.py`](scripts/test_cross_episode_consistency.py) — 三视图跨集一致性验证（7 项断言）
-- [`scripts/test_tts_validation_video_sync.py`](scripts/test_tts_validation_video_sync.py) — TTS 校验 + 音画对齐验证（6 项断言）
+v2.0.0 阶段曾包含三视图跨集一致性、TTS 校验 + 音画对齐等功能验证脚本，已在 v3.0.0 中精简。仓库现仅保留 `scripts/run_one_episode.py` 作为单集管线入口。
 
 ---
 

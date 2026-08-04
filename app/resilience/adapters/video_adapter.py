@@ -1,6 +1,6 @@
-﻿"""视频生成适配器：火山方舟 Seedance (ARK SDK content_generation.tasks)
+"""视频生成适配器：火山方舟 Seedance (ARK SDK content_generation.tasks)
 
- 真实实现：通过 volcengine SDK 调用 seedance 图生视频。
+真实实现：通过 volcengine SDK 调用 seedance 图生视频。
 - 提交任务 → 轮询状态 → 下载视频
 - KEY_SCENE → Seedance 图生视频，NORMAL_SCENE → FFmpeg Ken Burns 静态图运镜
 """
@@ -133,14 +133,22 @@ class VolcengineVideoAdapter(VideoAdapter):
             task_id = create_result.id
             logger.info("Seedance task submitted: %s", task_id)
 
-            # Poll for completion
-            max_wait = 600  # 10 min max
-            poll_interval = 15
+            # Poll for completion (adaptive interval)
+            from app.core.config import settings
+            max_wait = settings.VIDEO_POLL_MAX_WAIT_S
+            poll_intervals = [5, 5, 10, 10, 15]  # 自适应轮询：先快后慢
             elapsed = 0
+            interval_idx = 0
             while elapsed < max_wait:
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
-                get_result = client.content_generation.tasks.get(task_id=task_id)
+                interval = poll_intervals[min(interval_idx, len(poll_intervals) - 1)]
+                await asyncio.sleep(interval)
+                elapsed += interval
+                interval_idx += 1
+                try:
+                    get_result = client.content_generation.tasks.get(task_id=task_id)
+                except Exception as e:
+                    logger.warning("Seedance poll error (elapsed %ds): %s", elapsed, e)
+                    continue
                 status = get_result.status
                 if status == "succeeded":
                     logger.info("Seedance task succeeded: %s (%ds)", task_id, elapsed)
@@ -190,8 +198,6 @@ class VolcengineVideoAdapter(VideoAdapter):
         if not video_url:
             return ""
         os.makedirs(VIDEO_OUTPUT_DIR, exist_ok=True)
-        # 使用完整 task_id（避免前16位截断导致冲突）+ 时间戳 nonce 防止重复
-        # volcengine task_id 格式: cgt-YYYYMMDDHHMMSS-xxxxx-xxxxx，前16位完全相同会导致覆盖
         safe_id = task_id.replace("/", "_").replace("\\", "_")
         nonce = int(time.time() * 1000) % 100000
         fname = "seedance_{}_{}.mp4".format(safe_id, nonce)
@@ -200,13 +206,56 @@ class VolcengineVideoAdapter(VideoAdapter):
             async with httpx.AsyncClient(timeout=300) as c:
                 r = await c.get(video_url)
                 if r.status_code == 200:
+                    content = r.content
+                    if len(content) < 10240:
+                        logger.error(
+                            "Video download too small: %s (%d bytes) — likely error page or corrupted",
+                            local, len(content),
+                        )
+                        return ""
                     with open(local, "wb") as f:
-                        f.write(r.content)
-                    logger.info("Video downloaded: %s (%d bytes)", local, len(r.content))
+                        f.write(content)
+                    logger.info("Video downloaded: %s (%d bytes)", local, len(content))
+                    if not self._validate_video_file(local):
+                        logger.error("Video file validation failed after download: %s", local)
+                        try:
+                            os.remove(local)
+                        except Exception:
+                            pass
+                        return ""
                     return local
+                else:
+                    logger.error("Video download HTTP %d: %s", r.status_code, video_url[:80])
         except Exception as e:
             logger.warning("Video download failed: %s", e)
-        return video_url
+        return ""
+
+    @staticmethod
+    def _validate_video_file(path: str) -> bool:
+        """验证视频文件有效：存在、非空、ffprobe 可解析。"""
+        if not path or not os.path.isfile(path):
+            return False
+        if os.path.getsize(path) < 10240:
+            logger.warning("Video file too small: %s (%d bytes)", path, os.path.getsize(path))
+            return False
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode != 0:
+                logger.warning("ffprobe failed for %s: %s", path, r.stderr[:200])
+                return False
+            dur = float(r.stdout.strip() or "0")
+            if dur < 0.5:
+                logger.warning("Video duration too short: %s (%.2fs)", path, dur)
+                return False
+            return True
+        except Exception as e:
+            logger.warning("Video validation exception for %s: %s", path, e)
+            return False
 
 
 class FFmpegKenBurnsAdapter(VideoAdapter):
